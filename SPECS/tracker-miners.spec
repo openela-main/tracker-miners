@@ -14,13 +14,15 @@
 
 Name:           tracker-miners
 Version:        2.1.5
-Release:        1%{?dist}
+Release:        2%{?dist}.1
 Summary:        Tracker miners and metadata extractors
 
 # libtracker-extract is LGPLv2+; the miners are a mix of GPLv2+ and LGPLv2+ code
 License:        GPLv2+ and LGPLv2+
 URL:            https://wiki.gnome.org/Projects/Tracker
 Source0:        https://download.gnome.org/sources/%{name}/2.1/%{name}-%{version}.tar.xz
+
+Patch1:         backport-seccomp-improvements.diff
 
 BuildRequires:  giflib-devel
 BuildRequires:  intltool
@@ -127,6 +129,14 @@ rm -f %{buildroot}%{_libdir}/tracker-miners-2.0/*.so
 
 
 %changelog
+* Wed Dec 06 2023 Carlos Garnacho <cgarnach@redhat.com> - 2.1.5-2.el8_9.1
+- Fix issues and missing syscalls in seccomp improvements backport
+  Resolves: RHEL-12465
+
+* Tue Dec 05 2023 Carlos Garnacho <cgarnach@redhat.com> - 2.1.5-2
+- Backport stricter seccomp jail
+  Resolves: RHEL-12465
+
 * Fri Sep 28 2018 Kalev Lember <klember@redhat.com> - 2.1.5-1
 - Update to 2.1.5
 

@@ -24,7 +24,7 @@
 
 Name:           tracker-miners
 Version:        3.1.2
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Tracker miners and metadata extractors
 
 # libtracker-extract and libtracker-miner libraries are LGPLv2+; the miners are a mix of GPLv2+ and LGPLv2+ code
@@ -33,6 +33,7 @@ URL:            https://gnome.pages.gitlab.gnome.org/tracker/
 Source0:        https://download.gnome.org/sources/tracker-miners/3.1/tracker-miners-%{tarball_version}.tar.xz
 
 Patch1: 0001-libtracker-common-Backport-seccomp-additions-from-3..patch
+Patch2: stricter-seccomp.diff
 
 BuildRequires:  asciidoc
 BuildRequires:  gcc
@@ -144,6 +145,10 @@ This package contains various miners and metadata extractors for tracker.
 
 
 %changelog
+* Thu Nov 30 2023 Carlos Garnacho <cgarnach@redhat.com> - 3.1.2-4
+- Backport stricter seccomp jail
+  Resolves: RHEL-12469
+
 * Tue Nov 22 2022 Carlos Garnacho <cgarnach@redhat.com> - 3.1.2-3
 - Do not include RSS miner service on RHEL
   Resolves: rhbz#2041633

@@ -1,0 +1,4064 @@
+From 35210d593361a671068b8bdfedb50481a5c8cb1b Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Sat, 23 Sep 2023 10:42:37 +0200
+Subject: [PATCH 01/23] tracker-extract: Drop SIGINT/SIGTERM handlers
+
+These bring some questions if using seccomp for the full
+process (e.g. requiring additional syscalls, or glib spawning
+a thread for it), and are not really mandatory since there's
+no requirements for a clean exit.
+
+The only thing that is somewhat lost is ease at valgrinding
+with noise from things "definitely lost" in the abrupt termination,
+but that does already require manually disabling the seccomp
+jail, it's not a big stretch to pile up more local hacks, or
+ignore the noise.
+---
+ src/tracker-extract/tracker-main.c | 42 ------------------------------
+ 1 file changed, 42 deletions(-)
+
+diff --git a/src/tracker-extract/tracker-main.c b/src/tracker-extract/tracker-main.c
+index c1a09685c..eb4e5d0e0 100644
+--- a/src/tracker-extract/tracker-main.c
++++ b/src/tracker-extract/tracker-main.c
+@@ -129,46 +129,6 @@ initialize_priority_and_scheduling (void)
+ 	}
+ }
+ 
+-static gboolean
+-signal_handler (gpointer user_data)
+-{
+-	int signo = GPOINTER_TO_INT (user_data);
+-
+-	static gboolean in_loop = FALSE;
+-
+-	/* Die if we get re-entrant signals handler calls */
+-	if (in_loop) {
+-		_exit (EXIT_FAILURE);
+-	}
+-
+-	switch (signo) {
+-	case SIGTERM:
+-	case SIGINT:
+-		in_loop = TRUE;
+-		g_main_loop_quit (main_loop);
+-
+-		/* Fall through */
+-	default:
+-		if (g_strsignal (signo)) {
+-			g_debug ("Received signal:%d->'%s'",
+-			         signo,
+-			         g_strsignal (signo));
+-		}
+-		break;
+-	}
+-
+-	return G_SOURCE_CONTINUE;
+-}
+-
+-static void
+-initialize_signal_handler (void)
+-{
+-#ifndef G_OS_WIN32
+-	g_unix_signal_add (SIGTERM, signal_handler, GINT_TO_POINTER (SIGTERM));
+-	g_unix_signal_add (SIGINT, signal_handler, GINT_TO_POINTER (SIGINT));
+-#endif /* G_OS_WIN32 */
+-}
+-
+ static void
+ log_option_values (TrackerConfig *config)
+ {
+@@ -467,8 +427,6 @@ main (int argc, char *argv[])
+ 
+ 	tracker_miner_start (TRACKER_MINER (decorator));
+ 
+-	initialize_signal_handler ();
+-
+ 	g_main_loop_run (main_loop);
+ 
+ 	my_main_loop = main_loop;
+-- 
+2.43.0
+
+
+From 1ee1468198e2b3e208a2d1bd87c4585625d5fc21 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Sun, 24 Sep 2023 11:50:46 +0200
+Subject: [PATCH 02/23] tracker-extract: Move error report handling to
+ tracker-miner-fs
+
+These error reports contain useful information in case metadata
+extraction failed for some files. However, it would be nice to
+have the tracker-extract-3 process uninvolved with file creation.
+
+To make it so for error reports, use a D-Bus signal on a new
+interface at the tracker-extract-3 process, that is picked up by
+tracker-miner-fs-3. The deletion of stale error reports is already
+performed by tracker-miner-fs-3, and the `tracker3 status` CLI as
+a last resort.
+---
+ src/libtracker-miner/tracker-decorator.c      | 31 +++-----
+ src/miners/fs/tracker-extract-watchdog.c      | 53 ++++++++++++++
+ .../tracker-extract-controller.c              | 72 +++++++++++++++++++
+ .../tracker-extract-decorator.c               |  8 +--
+ src/tracker-extract/tracker-main.c            | 14 ----
+ 5 files changed, 139 insertions(+), 39 deletions(-)
+
+diff --git a/src/libtracker-miner/tracker-decorator.c b/src/libtracker-miner/tracker-decorator.c
+index 5b83490d8..c9004139b 100644
+--- a/src/libtracker-miner/tracker-decorator.c
++++ b/src/libtracker-miner/tracker-decorator.c
+@@ -102,6 +102,7 @@ enum {
+ 	ITEMS_AVAILABLE,
+ 	FINISHED,
+ 	ERROR,
++	RAISE_ERROR,
+ 	LAST_SIGNAL
+ };
+ 
+@@ -269,24 +270,6 @@ retry_synchronously (TrackerDecorator *decorator,
+ 	}
+ }
+ 
+-static void
+-tag_success (TrackerDecorator *decorator,
+-             GArray           *commit_buffer)
+-{
+-	guint i;
+-
+-	for (i = 0; i < commit_buffer->len; i++) {
+-		SparqlUpdate *update;
+-		GFile *file;
+-
+-		update = &g_array_index (commit_buffer, SparqlUpdate, i);
+-
+-		file = g_file_new_for_uri (update->url);
+-		tracker_error_report_delete (file);
+-		g_object_unref (file);
+-	}
+-}
+-
+ static void
+ decorator_commit_cb (GObject      *object,
+                      GAsyncResult *result,
+@@ -305,8 +288,6 @@ decorator_commit_cb (GObject      *object,
+ 	if (!tracker_sparql_connection_update_array_finish (conn, result, NULL)) {
+ 		g_debug ("SPARQL error detected in batch, retrying one by one");
+ 		retry_synchronously (decorator, priv->commit_buffer);
+-	} else {
+-		tag_success (decorator, priv->commit_buffer);
+ 	}
+ 
+ 	g_clear_pointer (&priv->commit_buffer, g_array_unref);
+@@ -1080,6 +1061,16 @@ tracker_decorator_class_init (TrackerDecoratorClass *klass)
+ 		              G_TYPE_STRING,
+ 		              G_TYPE_STRING,
+ 		              G_TYPE_STRING);
++
++	signals[RAISE_ERROR] =
++		g_signal_new ("raise-error",
++		              G_OBJECT_CLASS_TYPE (object_class),
++		              G_SIGNAL_RUN_LAST,
++		              0, NULL, NULL, NULL,
++		              G_TYPE_NONE, 3,
++			      G_TYPE_FILE,
++			      G_TYPE_STRING,
++			      G_TYPE_STRING);
+ }
+ 
+ static void
+diff --git a/src/miners/fs/tracker-extract-watchdog.c b/src/miners/fs/tracker-extract-watchdog.c
+index 41e12a51c..095ecef00 100644
+--- a/src/miners/fs/tracker-extract-watchdog.c
++++ b/src/miners/fs/tracker-extract-watchdog.c
+@@ -38,6 +38,7 @@ struct _TrackerExtractWatchdog {
+ 	gchar *domain;
+ 	guint extractor_watchdog_id;
+ 	guint progress_signal_id;
++	guint error_signal_id;
+ 	gboolean initializing;
+ };
+ 
+@@ -82,6 +83,47 @@ on_extract_progress_cb (GDBusConnection *conn,
+ 	               status, progress, (gint) remaining);
+ }
+ 
++static void
++on_extract_error_cb (GDBusConnection *conn,
++                     const gchar     *sender_name,
++                     const gchar     *object_path,
++                     const gchar     *interface_name,
++                     const gchar     *signal_name,
++                     GVariant        *parameters,
++                     gpointer         user_data)
++{
++	g_autoptr (GVariant) uri = NULL, message = NULL, extra = NULL, child = NULL;
++	GVariantIter iter;
++	GVariant *value;
++	gchar *key;
++
++	child = g_variant_get_child_value (parameters, 0);
++	g_variant_iter_init (&iter, child);
++
++	while (g_variant_iter_next (&iter, "{sv}", &key, &value)) {
++		if (g_strcmp0 (key, "uri") == 0)
++			uri = g_variant_ref_sink (value);
++		else if (g_strcmp0 (key, "message") == 0)
++			message = g_variant_ref_sink (value);
++		else if (g_strcmp0 (key, "extra-info") == 0)
++			extra = g_variant_ref_sink (value);
++
++		g_variant_unref (value);
++		g_free (key);
++	}
++
++	if (g_variant_is_of_type (uri, G_VARIANT_TYPE_STRING) &&
++	    g_variant_is_of_type (message, G_VARIANT_TYPE_STRING) &&
++	    (!extra || g_variant_is_of_type (extra, G_VARIANT_TYPE_STRING))) {
++		g_autoptr (GFile) file = NULL;
++
++		file = g_file_new_for_uri (g_variant_get_string (uri, NULL));
++		tracker_error_report (file,
++		                      g_variant_get_string (message, NULL),
++		                      extra ? g_variant_get_string (extra, NULL) : NULL);
++	}
++}
++
+ static void
+ extract_watchdog_name_appeared (GDBusConnection *conn,
+ 				const gchar     *name,
+@@ -105,6 +147,17 @@ extract_watchdog_name_appeared (GDBusConnection *conn,
+ 		                                    on_extract_progress_cb,
+ 		                                    watchdog,
+ 		                                    NULL);
++	watchdog->error_signal_id =
++		g_dbus_connection_signal_subscribe (watchdog->conn,
++		                                    "org.freedesktop.Tracker3.Miner.Extract",
++		                                    "org.freedesktop.Tracker3.Extract",
++		                                    "Error",
++		                                    "/org/freedesktop/Tracker3/Extract",
++		                                    NULL,
++		                                    G_DBUS_SIGNAL_FLAGS_NONE,
++		                                    on_extract_error_cb,
++		                                    watchdog,
++		                                    NULL);
+ }
+ 
+ static void
+diff --git a/src/tracker-extract/tracker-extract-controller.c b/src/tracker-extract/tracker-extract-controller.c
+index d7e79406a..f3d9f7bcb 100644
+--- a/src/tracker-extract/tracker-extract-controller.c
++++ b/src/tracker-extract/tracker-extract-controller.c
+@@ -33,11 +33,23 @@ struct TrackerExtractControllerPrivate {
+ 	TrackerConfig *config;
+ 	GCancellable *cancellable;
+ 	GDBusConnection *connection;
++	guint object_id;
+ 	guint watch_id;
+ 	guint progress_signal_id;
+ 	gint paused;
+ };
+ 
++#define OBJECT_PATH "/org/freedesktop/Tracker3/Extract"
++
++static const gchar *introspection_xml =
++	"<node>"
++	"  <interface name='org.freedesktop.Tracker3.Extract'>"
++	"    <signal name='Error'>"
++	"      <arg type='a{sv}' name='data' direction='out' />"
++	"    </signal>"
++	"  </interface>"
++	"</node>";
++
+ G_DEFINE_TYPE_WITH_PRIVATE (TrackerExtractController, tracker_extract_controller, G_TYPE_OBJECT)
+ 
+ static void
+@@ -194,10 +206,52 @@ update_wait_for_miner_fs (TrackerExtractController *self)
+ 	}
+ }
+ 
++static void
++decorator_raise_error_cb (TrackerDecorator         *decorator,
++                          GFile                    *file,
++                          gchar                    *msg,
++                          gchar                    *extra,
++                          TrackerExtractController *controller)
++{
++	TrackerExtractControllerPrivate *priv =
++		tracker_extract_controller_get_instance_private (controller);
++	g_autoptr (GError) error = NULL;
++	g_autofree gchar *uri = NULL;
++	GVariantBuilder builder;
++
++	uri = g_file_get_uri (file);
++
++	g_variant_builder_init (&builder, G_VARIANT_TYPE ("a{sv}"));
++	g_variant_builder_add (&builder, "{sv}", "uri",
++	                       g_variant_new_string (uri));
++	g_variant_builder_add (&builder, "{sv}", "message",
++	                       g_variant_new_string (msg));
++
++	if (extra) {
++		g_variant_builder_add (&builder, "{sv}", "extra-info",
++		                       g_variant_new_string (extra));
++	}
++
++	g_dbus_connection_emit_signal (priv->connection,
++	                               NULL,
++	                               OBJECT_PATH,
++	                               "org.freedesktop.Tracker3.Extract",
++	                               "Error",
++	                               g_variant_new ("(@a{sv})", g_variant_builder_end (&builder)),
++	                               &error);
++
++	if (error)
++		g_warning ("Could not emit signal: %s\n", error->message);
++}
++
+ static void
+ tracker_extract_controller_constructed (GObject *object)
+ {
+ 	TrackerExtractController *self = (TrackerExtractController *) object;
++	g_autoptr (GDBusNodeInfo) introspection_data = NULL;
++	GDBusInterfaceVTable interface_vtable = {
++		NULL, NULL, NULL
++	};
+ 
+ 	G_OBJECT_CLASS (tracker_extract_controller_parent_class)->constructed (object);
+ 
+@@ -209,6 +263,19 @@ tracker_extract_controller_constructed (GObject *object)
+ 	                         G_CALLBACK (update_wait_for_miner_fs),
+ 	                         self, G_CONNECT_SWAPPED);
+ 	update_wait_for_miner_fs (self);
++
++	g_signal_connect (self->priv->decorator, "raise-error",
++	                  G_CALLBACK (decorator_raise_error_cb), object);
++
++	introspection_data = g_dbus_node_info_new_for_xml (introspection_xml, NULL);
++	g_assert (introspection_data);
++	self->priv->object_id =
++		g_dbus_connection_register_object (self->priv->connection,
++						   OBJECT_PATH,
++		                                   introspection_data->interfaces[0],
++		                                   &interface_vtable,
++		                                   object,
++		                                   NULL, NULL);
+ }
+ 
+ static void
+@@ -253,6 +320,11 @@ tracker_extract_controller_dispose (GObject *object)
+ {
+ 	TrackerExtractController *self = (TrackerExtractController *) object;
+ 
++	if (self->priv->connection && self->priv->object_id) {
++		g_dbus_connection_unregister_object (self->priv->connection, self->priv->object_id);
++		self->priv->object_id = 0;
++	}
++
+ 	disconnect_all (self);
+ 	g_clear_object (&self->priv->decorator);
+ 	g_clear_object (&self->priv->config);
+diff --git a/src/tracker-extract/tracker-extract-decorator.c b/src/tracker-extract/tracker-extract-decorator.c
+index b338168a6..d9b515fd6 100644
+--- a/src/tracker-extract/tracker-extract-decorator.c
++++ b/src/tracker-extract/tracker-extract-decorator.c
+@@ -461,7 +461,7 @@ decorator_ignore_file (GFile                   *file,
+ 	                          NULL, &error);
+ 
+ 	if (info) {
+-		tracker_error_report (file, error_message, extra_info);
++		g_signal_emit_by_name (decorator, "raise-error", file, error_message, extra_info);
+ 
+ 		mimetype = g_file_info_get_attribute_string (info,
+ 		                                             G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE);
+@@ -475,10 +475,8 @@ decorator_ignore_file (GFile                   *file,
+ 	} else {
+ 		g_debug ("Could not get mimetype: %s", error->message);
+ 
+-		if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
+-			tracker_error_report_delete (file);
+-		else
+-			tracker_error_report (file, error->message, NULL);
++		if (error && !g_error_matches (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
++			g_signal_emit_by_name (decorator, "raise-error", file, error_message, extra_info);
+ 
+ 		g_clear_error (&error);
+ 		query = g_strdup_printf ("DELETE {"
+diff --git a/src/tracker-extract/tracker-main.c b/src/tracker-extract/tracker-main.c
+index eb4e5d0e0..422c53044 100644
+--- a/src/tracker-extract/tracker-main.c
++++ b/src/tracker-extract/tracker-main.c
+@@ -242,15 +242,6 @@ on_decorator_finished (TrackerDecorator *decorator,
+ 	                                             main_loop);
+ }
+ 
+-static GFile *
+-get_cache_dir (TrackerDomainOntology *domain_ontology)
+-{
+-	GFile *cache;
+-
+-	cache = tracker_domain_ontology_get_cache (domain_ontology);
+-	return g_file_get_child (cache, "files");
+-}
+-
+ int
+ main (int argc, char *argv[])
+ {
+@@ -265,7 +256,6 @@ main (int argc, char *argv[])
+ 	TrackerSparqlConnection *sparql_connection;
+ 	TrackerDomainOntology *domain_ontology;
+ 	gchar *dbus_name, *miner_dbus_name;
+-	GFile *cache_dir;
+ 
+ 	bindtextdomain (GETTEXT_PACKAGE, LOCALEDIR);
+ 	bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
+@@ -328,10 +318,6 @@ main (int argc, char *argv[])
+ 		return EXIT_FAILURE;
+ 	}
+ 
+-	cache_dir = get_cache_dir (domain_ontology);
+-	tracker_error_report_init (cache_dir);
+-	g_object_unref (cache_dir);
+-
+ 	config = tracker_config_new ();
+ 
+ 	/* Extractor command line arguments */
+-- 
+2.43.0
+
+
+From 5d38b86d699a79eee7e9a9c35ed69a227352f5b0 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Sun, 24 Sep 2023 15:53:22 +0200
+Subject: [PATCH 03/23] tracker-extract: Drop handling of wait-for-miner-fs
+
+Even though this setting is off by default, that is the stock
+behavior of tracker-miner-fs, by activating the tracker-extract-3
+D-Bus name after going idle.
+
+Furthermore, enabling this setting will have clunky interaction
+with the current behavior since 3.1.0 that tracker-miner-fs-3
+forwards the tracker-extract-3 status (commit bd3ce694d7), since
+tracker-extract-3 activity will make the tracker-miner-fs-3 status
+"non-idle", which will pause the extractor, which will make the miner
+idle, which will unpause the extractor, ...
+
+It's arguable that we should keep supporting this as a setting
+altogether, so just drop the tracker-extract-3 side code handling
+this setting.
+---
+ .../tracker-extract-controller.c              | 166 ------------------
+ 1 file changed, 166 deletions(-)
+
+diff --git a/src/tracker-extract/tracker-extract-controller.c b/src/tracker-extract/tracker-extract-controller.c
+index f3d9f7bcb..1543a7237 100644
+--- a/src/tracker-extract/tracker-extract-controller.c
++++ b/src/tracker-extract/tracker-extract-controller.c
+@@ -30,12 +30,9 @@ enum {
+ 
+ struct TrackerExtractControllerPrivate {
+ 	TrackerDecorator *decorator;
+-	TrackerConfig *config;
+ 	GCancellable *cancellable;
+ 	GDBusConnection *connection;
+ 	guint object_id;
+-	guint watch_id;
+-	guint progress_signal_id;
+ 	gint paused;
+ };
+ 
+@@ -52,160 +49,6 @@ static const gchar *introspection_xml =
+ 
+ G_DEFINE_TYPE_WITH_PRIVATE (TrackerExtractController, tracker_extract_controller, G_TYPE_OBJECT)
+ 
+-static void
+-files_miner_idleness_changed (TrackerExtractController *self,
+-                              gboolean                  idle)
+-{
+-	if (idle && self->priv->paused) {
+-		tracker_miner_resume (TRACKER_MINER (self->priv->decorator));
+-		self->priv->paused = FALSE;
+-	} else if (!idle && !self->priv->paused) {
+-		self->priv->paused = FALSE;
+-		tracker_miner_pause (TRACKER_MINER (self->priv->decorator));
+-	}
+-}
+-
+-static void
+-files_miner_status_changed (TrackerExtractController *self,
+-                            const gchar              *status)
+-{
+-	files_miner_idleness_changed (self, g_str_equal (status, "Idle"));
+-}
+-
+-static void
+-files_miner_get_status_cb (GObject      *source,
+-                           GAsyncResult *result,
+-                           gpointer      user_data)
+-{
+-	TrackerExtractController *self = user_data;
+-	GDBusConnection *conn = (GDBusConnection *) source;
+-	GVariant *reply;
+-	const gchar *status;
+-	GError *error = NULL;
+-
+-	reply = g_dbus_connection_call_finish (conn, result, &error);
+-	if (!reply) {
+-		g_debug ("Failed to get tracker-miner-fs status: %s",
+-		         error->message);
+-		g_clear_error (&error);
+-	} else {
+-		g_variant_get (reply, "(&s)", &status);
+-		files_miner_status_changed (self, status);
+-		g_variant_unref (reply);
+-	}
+-
+-	g_clear_object (&self->priv->cancellable);
+-	g_object_unref (self);
+-}
+-
+-static void
+-appeared_cb (GDBusConnection *connection,
+-             const gchar     *name,
+-             const gchar     *name_owner,
+-             gpointer         user_data)
+-{
+-	TrackerExtractController *self = user_data;
+-
+-	/* Get initial status */
+-	self->priv->cancellable = g_cancellable_new ();
+-	g_dbus_connection_call (connection,
+-	                        "org.freedesktop.Tracker3.Miner.Files",
+-	                        "/org/freedesktop/Tracker3/Miner/Files",
+-	                        "org.freedesktop.Tracker3.Miner",
+-	                        "GetStatus",
+-	                        NULL,
+-	                        G_VARIANT_TYPE ("(s)"),
+-	                        G_DBUS_CALL_FLAGS_NO_AUTO_START,
+-	                        -1,
+-	                        self->priv->cancellable,
+-	                        files_miner_get_status_cb,
+-	                        g_object_ref (self));
+-}
+-
+-static void
+-vanished_cb (GDBusConnection *connection,
+-             const gchar     *name,
+-             gpointer         user_data)
+-{
+-	TrackerExtractController *self = user_data;
+-
+-	/* tracker-miner-fs vanished, we don't have anything to wait for
+-	 * anymore. */
+-	files_miner_idleness_changed (self, TRUE);
+-}
+-
+-static void
+-files_miner_progress_cb (GDBusConnection *connection,
+-                         const gchar     *sender_name,
+-                         const gchar     *object_path,
+-                         const gchar     *interface_name,
+-                         const gchar     *signal_name,
+-                         GVariant        *parameters,
+-                         gpointer         user_data)
+-{
+-	TrackerExtractController *self = user_data;
+-	const gchar *status;
+-
+-	g_return_if_fail (g_variant_is_of_type (parameters, G_VARIANT_TYPE ("(sdi)")));
+-
+-	/* If we didn't get the initial status yet, ignore Progress signals */
+-	if (self->priv->cancellable)
+-		return;
+-
+-	g_variant_get (parameters, "(&sdi)", &status, NULL, NULL);
+-	files_miner_status_changed (self, status);
+-}
+-
+-static void
+-disconnect_all (TrackerExtractController *self)
+-{
+-	GDBusConnection *conn = self->priv->connection;
+-
+-	if (self->priv->watch_id != 0)
+-		g_bus_unwatch_name (self->priv->watch_id);
+-	self->priv->watch_id = 0;
+-
+-	if (self->priv->progress_signal_id != 0)
+-		g_dbus_connection_signal_unsubscribe (conn,
+-		                                      self->priv->progress_signal_id);
+-	self->priv->progress_signal_id = 0;
+-
+-	if (self->priv->cancellable)
+-		g_cancellable_cancel (self->priv->cancellable);
+-	g_clear_object (&self->priv->cancellable);
+-}
+-
+-static void
+-update_wait_for_miner_fs (TrackerExtractController *self)
+-{
+-	GDBusConnection *conn = self->priv->connection;
+-
+-	if (tracker_config_get_wait_for_miner_fs (self->priv->config)) {
+-		self->priv->progress_signal_id =
+-			g_dbus_connection_signal_subscribe (conn,
+-			                                    "org.freedesktop.Tracker3.Miner.Files",
+-			                                    "org.freedesktop.Tracker3.Miner",
+-			                                    "Progress",
+-			                                    "/org/freedesktop/Tracker3/Miner/Files",
+-			                                    NULL,
+-			                                    G_DBUS_SIGNAL_FLAGS_NONE,
+-			                                    files_miner_progress_cb,
+-			                                    self, NULL);
+-
+-		/* appeared_cb is guaranteed to be called even if the service
+-		 * was already running, so we'll start the miner from there. */
+-		self->priv->watch_id = g_bus_watch_name_on_connection (conn,
+-		                                                       "org.freedesktop.Tracker3.Miner.Files",
+-		                                                       G_BUS_NAME_WATCHER_FLAGS_NONE,
+-		                                                       appeared_cb,
+-		                                                       vanished_cb,
+-		                                                       self, NULL);
+-	} else {
+-		disconnect_all (self);
+-		files_miner_idleness_changed (self, TRUE);
+-	}
+-}
+-
+ static void
+ decorator_raise_error_cb (TrackerDecorator         *decorator,
+                           GFile                    *file,
+@@ -257,13 +100,6 @@ tracker_extract_controller_constructed (GObject *object)
+ 
+ 	g_assert (self->priv->decorator != NULL);
+ 
+-	self->priv->config = g_object_ref (tracker_main_get_config ());
+-	g_signal_connect_object (self->priv->config,
+-	                         "notify::wait-for-miner-fs",
+-	                         G_CALLBACK (update_wait_for_miner_fs),
+-	                         self, G_CONNECT_SWAPPED);
+-	update_wait_for_miner_fs (self);
+-
+ 	g_signal_connect (self->priv->decorator, "raise-error",
+ 	                  G_CALLBACK (decorator_raise_error_cb), object);
+ 
+@@ -325,9 +161,7 @@ tracker_extract_controller_dispose (GObject *object)
+ 		self->priv->object_id = 0;
+ 	}
+ 
+-	disconnect_all (self);
+ 	g_clear_object (&self->priv->decorator);
+-	g_clear_object (&self->priv->config);
+ 
+ 	G_OBJECT_CLASS (tracker_extract_controller_parent_class)->dispose (object);
+ }
+-- 
+2.43.0
+
+
+From cf2dd9b1a00a5f8bfb22b30ab196d2bfd06b1270 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Sun, 24 Sep 2023 16:54:39 +0200
+Subject: [PATCH 04/23] tracker-extract: Move text allow list handling to
+ tracker-miner-fs-3
+
+This is something that can be streamlined without delayed handling from
+tracker-extract-3. But also avoids having to poke for this setting in
+that process.
+---
+ .../tracker-module-manager.c                  | 35 ++++++++
+ .../tracker-module-manager.h                  |  3 +
+ src/miners/fs/tracker-miner-files.c           | 82 +++++++++++++++++++
+ src/miners/fs/tracker-miner-files.h           |  3 +
+ src/tracker-extract/tracker-extract-text.c    | 52 ++++--------
+ 5 files changed, 138 insertions(+), 37 deletions(-)
+
+diff --git a/src/libtracker-extract/tracker-module-manager.c b/src/libtracker-extract/tracker-module-manager.c
+index 83c9453e0..e23fab0bc 100644
+--- a/src/libtracker-extract/tracker-module-manager.c
++++ b/src/libtracker-extract/tracker-module-manager.c
+@@ -408,6 +408,41 @@ tracker_extract_module_manager_get_all_rdf_types (void)
+ 	return types;
+ }
+ 
++gboolean
++tracker_extract_module_manager_check_fallback_rdf_type (const gchar *mimetype,
++                                                        const gchar *rdf_type)
++{
++	GList *l, *list;
++	gint i;
++
++	g_return_val_if_fail (mimetype, FALSE);
++	g_return_val_if_fail (rdf_type, FALSE);
++
++	if (!initialized &&
++	    !tracker_extract_module_manager_init ()) {
++		return FALSE;
++	}
++
++	list = lookup_rules (mimetype);
++
++	for (l = list; l; l = l->next) {
++		RuleInfo *r_info = l->data;
++
++		if (r_info->fallback_rdf_types == NULL)
++			continue;
++
++		for (i = 0; r_info->fallback_rdf_types[i]; i++) {
++			if (g_strcmp0 (r_info->fallback_rdf_types[i], rdf_type) == 0)
++				return TRUE;
++		}
++
++                /* We only want the first RDF types matching */
++                break;
++	}
++
++	return FALSE;
++}
++
+ static ModuleInfo *
+ load_module (RuleInfo *info)
+ {
+diff --git a/src/libtracker-extract/tracker-module-manager.h b/src/libtracker-extract/tracker-module-manager.h
+index 0139c11b5..c502dcfd6 100644
+--- a/src/libtracker-extract/tracker-module-manager.h
++++ b/src/libtracker-extract/tracker-module-manager.h
+@@ -48,6 +48,9 @@ GStrv     tracker_extract_module_manager_get_rdf_types (const gchar *mimetype);
+ const gchar * tracker_extract_module_manager_get_graph (const gchar *mimetype);
+ const gchar * tracker_extract_module_manager_get_hash  (const gchar *mimetype);
+ 
++gboolean tracker_extract_module_manager_check_fallback_rdf_type (const gchar *mimetype,
++                                                                 const gchar *rdf_type);
++
+ GModule * tracker_extract_module_manager_get_module (const gchar                 *mimetype,
+                                                      const gchar                **rule_out,
+                                                      TrackerExtractMetadataFunc  *extract_func_out);
+diff --git a/src/miners/fs/tracker-miner-files.c b/src/miners/fs/tracker-miner-files.c
+index 098b105dc..b1bf04e54 100644
+--- a/src/miners/fs/tracker-miner-files.c
++++ b/src/miners/fs/tracker-miner-files.c
+@@ -82,6 +82,9 @@ struct TrackerMinerFilesPrivate {
+ 	gchar *domain;
+ 	TrackerDomainOntology *domain_ontology;
+ 
++	GSettings *extract_settings;
++	GStrv allowed_text_patterns;
++
+ 	guint disk_space_check_id;
+ 	gboolean disk_space_pause;
+ 
+@@ -122,6 +125,8 @@ enum {
+ 	PROP_DOMAIN,
+ };
+ 
++#define TEXT_ALLOWLIST "text-allowlist"
++
+ static void        miner_files_set_property             (GObject              *object,
+                                                          guint                 param_id,
+                                                          const GValue         *value,
+@@ -380,6 +385,15 @@ miner_files_initable_iface_init (GInitableIface *iface)
+ 	iface->init = miner_files_initable_init;
+ }
+ 
++static void
++text_allowlist_changed_cb (GSettings         *settings,
++                           const gchar       *key,
++                           TrackerMinerFiles *mf)
++{
++	g_clear_pointer (&mf->private->allowed_text_patterns, g_strfreev);
++	mf->private->allowed_text_patterns = g_settings_get_strv (settings, TEXT_ALLOWLIST);
++}
++
+ static gboolean
+ miner_files_initable_init (GInitable     *initable,
+                            GCancellable  *cancellable,
+@@ -669,6 +683,12 @@ miner_files_initable_init (GInitable     *initable,
+ 	                  G_CALLBACK (on_extractor_status), mf);
+ 	g_free (domain_name);
+ 
++	mf->private->extract_settings = g_settings_new ("org.freedesktop.Tracker3.Extract");
++	g_signal_connect (mf->private->extract_settings, "changed::" TEXT_ALLOWLIST,
++	                  G_CALLBACK (text_allowlist_changed_cb), mf);
++	mf->private->allowed_text_patterns = g_settings_get_strv (mf->private->extract_settings,
++	                                                          TEXT_ALLOWLIST);
++
+ 	return TRUE;
+ }
+ 
+@@ -734,6 +754,9 @@ miner_files_finalize (GObject *object)
+ 		priv->grace_period_timeout_id = 0;
+ 	}
+ 
++	g_clear_object (&mf->private->extract_settings);
++	g_clear_pointer (&mf->private->allowed_text_patterns, g_strfreev);
++
+ 	g_signal_handlers_disconnect_by_func (priv->extract_watchdog,
+ 	                                      on_extractor_lost,
+ 	                                      NULL);
+@@ -2053,6 +2076,31 @@ miner_files_create_folder_information_element (TrackerMinerFiles *miner,
+ 	return resource;
+ }
+ 
++static TrackerResource *
++miner_files_create_text_file_information_element (TrackerMinerFiles *miner,
++                                                  GFile             *file,
++                                                  const gchar       *mime_type,
++                                                  gboolean           create)
++{
++	TrackerResource *resource;
++	GStrv rdf_types;
++	const gchar *urn;
++	int i;
++
++	urn = tracker_miner_fs_get_identifier (TRACKER_MINER_FS (miner),
++	                                       file, create, TRUE, NULL);
++	resource = tracker_resource_new (urn);
++
++	rdf_types = tracker_extract_module_manager_get_rdf_types (mime_type);
++
++	for (i = 0; rdf_types[i]; i++)
++		tracker_resource_add_uri (resource, "rdf:type", rdf_types[i]);
++
++	g_strfreev (rdf_types);
++
++	return resource;
++}
++
+ static void
+ miner_files_process_file (TrackerMinerFS      *fs,
+                           GFile               *file,
+@@ -2162,6 +2210,21 @@ miner_files_process_file (TrackerMinerFS      *fs,
+ 		time_str = g_date_time_format_iso8601 (modified);
+ 		tracker_resource_set_string (graph_file, "nfo:fileLastModified", time_str);
+ 		g_free (time_str);
++
++		if (tracker_extract_module_manager_check_fallback_rdf_type (mime_type,
++		                                                            "nfo:PlainTextDocument") &&
++		    !tracker_miner_files_check_allowed_text_file (TRACKER_MINER_FILES (fs), file)) {
++			TrackerResource *text_file;
++
++			/* We let disallowed text files have a shallow nie:InformationElement */
++			text_file = miner_files_create_text_file_information_element (TRACKER_MINER_FILES (fs),
++			                                                              file, mime_type, create);
++			tracker_resource_set_take_relation (graph_file, "nie:interpretedAs", text_file);
++			tracker_resource_set_uri (text_file, "nie:isStoredAs", uri);
++
++			tracker_resource_set_string (graph_file, "tracker:extractorHash",
++			                             tracker_extract_module_manager_get_hash (mime_type));
++		}
+ 	}
+ 
+ 	if (delete_properties_sparql)
+@@ -2937,3 +3000,22 @@ tracker_miner_files_set_mtime_checking (TrackerMinerFiles *mf,
+ {
+ 	mf->private->mtime_check = mtime_check;
+ }
++
++gboolean
++tracker_miner_files_check_allowed_text_file (TrackerMinerFiles *mf,
++                                             GFile             *file)
++{
++	g_autofree gchar *basename = NULL;
++	GStrv text_patterns;
++	int i;
++
++	basename = g_file_get_basename (file);
++	text_patterns = mf->private->allowed_text_patterns;
++
++	for (i = 0; text_patterns && text_patterns[i]; i++) {
++		if (g_pattern_match_simple (text_patterns[i], basename))
++			return TRUE;
++	}
++
++	return FALSE;
++}
+diff --git a/src/miners/fs/tracker-miner-files.h b/src/miners/fs/tracker-miner-files.h
+index 7198147b1..4c610ed05 100644
+--- a/src/miners/fs/tracker-miner-files.h
++++ b/src/miners/fs/tracker-miner-files.h
+@@ -77,6 +77,9 @@ void     tracker_miner_files_writeback_notify     (TrackerMinerFiles *mf,
+                                                    GFile             *file,
+                                                    const GError      *error);
+ 
++gboolean tracker_miner_files_check_allowed_text_file (TrackerMinerFiles *mf,
++                                                      GFile             *file);
++
+ G_END_DECLS
+ 
+ #endif /* __TRACKER_MINER_FS_FILES_H__ */
+diff --git a/src/tracker-extract/tracker-extract-text.c b/src/tracker-extract/tracker-extract-text.c
+index 4d51ec560..ecbfdf4d1 100644
+--- a/src/tracker-extract/tracker-extract-text.c
++++ b/src/tracker-extract/tracker-extract-text.c
+@@ -40,24 +40,6 @@
+ #include "tracker-extract.h"
+ #include "tracker-read.h"
+ 
+-static gboolean
+-allow_file (GSList      *text_allowlist_patterns,
+-            GFile       *file)
+-{
+-	GSList *l;
+-	g_autofree gchar *basename = NULL;
+-
+-	basename = g_file_get_basename (file);
+-
+-	for (l = text_allowlist_patterns; l; l = l->next) {
+-		if (g_pattern_match_string (l->data, basename)) {
+-			return TRUE;
+-		}
+-	}
+-
+-	return FALSE;
+-}
+-
+ static gchar *
+ get_file_content (GFile   *file,
+                   gsize    n_bytes,
+@@ -101,34 +83,30 @@ tracker_extract_get_metadata (TrackerExtractInfo  *info,
+ 	TrackerResource *metadata;
+ 	TrackerConfig *config;
+ 	GFile *file;
+-	GSList *text_allowlist_patterns;
+ 	gchar *content = NULL;
+ 	GError *inner_error = NULL;
+ 
+ 	config = tracker_main_get_config ();
+-	text_allowlist_patterns = tracker_config_get_text_allowlist_patterns (config);
+ 	file = tracker_extract_info_get_file (info);
+ 
+ 	metadata = tracker_resource_new (NULL);
+ 	tracker_resource_add_uri (metadata, "rdf:type", "nfo:PlainTextDocument");
+ 
+-	if (allow_file (text_allowlist_patterns, file)) {
+-		content = get_file_content (tracker_extract_info_get_file (info),
+-		                            tracker_config_get_max_bytes (config),
+-		                            &inner_error);
+-
+-		if (inner_error != NULL) {
+-			/* An error occurred, perhaps the file was deleted. */
+-			g_propagate_prefixed_error (error, inner_error, "Could not open:");
+-			return FALSE;
+-		}
+-
+-		if (content) {
+-			tracker_resource_set_string (metadata, "nie:plainTextContent", content);
+-			g_free (content);
+-		} else {
+-			tracker_resource_set_string (metadata, "nie:plainTextContent", "");
+-		}
++	content = get_file_content (tracker_extract_info_get_file (info),
++	                            tracker_config_get_max_bytes (config),
++	                            &inner_error);
++
++	if (inner_error != NULL) {
++		/* An error occurred, perhaps the file was deleted. */
++		g_propagate_prefixed_error (error, inner_error, "Could not open:");
++		return FALSE;
++	}
++
++	if (content) {
++		tracker_resource_set_string (metadata, "nie:plainTextContent", content);
++		g_free (content);
++	} else {
++		tracker_resource_set_string (metadata, "nie:plainTextContent", "");
+ 	}
+ 
+ 	tracker_extract_info_set_resource (info, metadata);
+-- 
+2.43.0
+
+
+From d4877c61f6b52dd2bdfd4aeef5f8b189bada75f9 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Sun, 24 Sep 2023 14:20:01 +0200
+Subject: [PATCH 05/23] tracker-extract: Handle configuration through D-Bus
+
+Add an interface on tracker-miner-fs-3 so that tracker-extract-3
+can get the relevant settings without using DConf/GSettings directly.
+This replaces all settings usage from tracker-extract-3.
+---
+ src/libtracker-extract/tracker-extract-info.c |  12 +-
+ src/libtracker-extract/tracker-extract-info.h |   5 +-
+ src/miners/fs/meson.build                     |   1 +
+ src/miners/fs/tracker-files-interface.c       | 184 +++++++++++
+ src/miners/fs/tracker-files-interface.h       |  35 +++
+ src/miners/fs/tracker-main.c                  |   6 +
+ src/tracker-extract/meson.build               |   1 -
+ src/tracker-extract/tracker-config.c          | 289 ------------------
+ src/tracker-extract/tracker-config.h          |  69 -----
+ .../tracker-extract-controller.c              |  61 ++++
+ src/tracker-extract/tracker-extract-epub.c    |  21 +-
+ src/tracker-extract/tracker-extract-html.c    |   4 +-
+ .../tracker-extract-msoffice-xml.c            |   6 +-
+ .../tracker-extract-msoffice.c                |   4 +-
+ src/tracker-extract/tracker-extract-oasis.c   |   6 +-
+ src/tracker-extract/tracker-extract-pdf.c     |   4 +-
+ src/tracker-extract/tracker-extract-text.c    |   4 +-
+ src/tracker-extract/tracker-extract.c         |  19 +-
+ src/tracker-extract/tracker-extract.h         |   3 +
+ src/tracker-extract/tracker-main.c            |  35 +--
+ src/tracker-extract/tracker-main.h            |   5 -
+ .../tracker-extract-info-test.c               |   4 +-
+ 22 files changed, 343 insertions(+), 435 deletions(-)
+ create mode 100644 src/miners/fs/tracker-files-interface.c
+ create mode 100644 src/miners/fs/tracker-files-interface.h
+ delete mode 100644 src/tracker-extract/tracker-config.c
+ delete mode 100644 src/tracker-extract/tracker-config.h
+
+diff --git a/src/libtracker-extract/tracker-extract-info.c b/src/libtracker-extract/tracker-extract-info.c
+index 46e5fb700..30200a9a6 100644
+--- a/src/libtracker-extract/tracker-extract-info.c
++++ b/src/libtracker-extract/tracker-extract-info.c
+@@ -45,6 +45,8 @@ struct _TrackerExtractInfo
+ 	gchar *mimetype;
+ 	gchar *graph;
+ 
++	gint max_text;
++
+ 	gint ref_count;
+ };
+ 
+@@ -66,7 +68,8 @@ G_DEFINE_BOXED_TYPE (TrackerExtractInfo, tracker_extract_info,
+ TrackerExtractInfo *
+ tracker_extract_info_new (GFile       *file,
+                           const gchar *mimetype,
+-                          const gchar *graph)
++                          const gchar *graph,
++                          gint         max_text)
+ {
+ 	TrackerExtractInfo *info;
+ 
+@@ -76,6 +79,7 @@ tracker_extract_info_new (GFile       *file,
+ 	info->file = g_object_ref (file);
+ 	info->mimetype = g_strdup (mimetype);
+ 	info->graph = g_strdup (graph);
++	info->max_text = max_text;
+ 
+ 	info->resource = NULL;
+ 
+@@ -231,3 +235,9 @@ tracker_extract_info_set_resource (TrackerExtractInfo *info,
+ 	g_object_ref (resource);
+ 	info->resource = resource;
+ }
++
++gint
++tracker_extract_info_get_max_text (TrackerExtractInfo *info)
++{
++	return info->max_text;
++}
+diff --git a/src/libtracker-extract/tracker-extract-info.h b/src/libtracker-extract/tracker-extract-info.h
+index 3751c6c94..3de67d181 100644
+--- a/src/libtracker-extract/tracker-extract-info.h
++++ b/src/libtracker-extract/tracker-extract-info.h
+@@ -37,13 +37,16 @@ GType                 tracker_extract_info_get_type               (void) G_GNUC_
+ 
+ TrackerExtractInfo *  tracker_extract_info_new                    (GFile              *file,
+                                                                    const gchar        *mimetype,
+-                                                                   const gchar        *graph);
++                                                                   const gchar        *graph,
++                                                                   gint                max_text);
+ TrackerExtractInfo *  tracker_extract_info_ref                    (TrackerExtractInfo *info);
+ void                  tracker_extract_info_unref                  (TrackerExtractInfo *info);
+ GFile *               tracker_extract_info_get_file               (TrackerExtractInfo *info);
+ const gchar *         tracker_extract_info_get_mimetype           (TrackerExtractInfo *info);
+ const gchar *         tracker_extract_info_get_graph              (TrackerExtractInfo *info);
+ 
++gint                  tracker_extract_info_get_max_text           (TrackerExtractInfo *info);
++
+ TrackerResource *     tracker_extract_info_get_resource           (TrackerExtractInfo *info);
+ void                  tracker_extract_info_set_resource           (TrackerExtractInfo *info,
+                                                                    TrackerResource    *resource);
+diff --git a/src/miners/fs/meson.build b/src/miners/fs/meson.build
+index 84326bef8..57c8ffdc5 100644
+--- a/src/miners/fs/meson.build
++++ b/src/miners/fs/meson.build
+@@ -1,6 +1,7 @@
+ sources = [
+     'tracker-config.c',
+     'tracker-extract-watchdog.c',
++    'tracker-files-interface.c',
+     'tracker-main.c',
+     'tracker-miner-files.c',
+     'tracker-storage.c',
+diff --git a/src/miners/fs/tracker-files-interface.c b/src/miners/fs/tracker-files-interface.c
+new file mode 100644
+index 000000000..150e40eab
+--- /dev/null
++++ b/src/miners/fs/tracker-files-interface.c
+@@ -0,0 +1,184 @@
++/*
++ * Copyright (C) 2023 Red Hat Inc.
++
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++ * Boston, MA  02110-1301, USA.
++ *
++ * Author: Carlos Garnacho <carlosg@gnome.org>
++ */
++
++#include "config-miners.h"
++
++#include "tracker-files-interface.h"
++
++struct _TrackerFilesInterface
++{
++	GObject parent_instance;
++	GDBusConnection *connection;
++	GSettings *settings;
++	guint object_id;
++};
++
++enum {
++	PROP_0,
++	PROP_CONNECTION,
++	N_PROPS,
++};
++
++static GParamSpec *props[N_PROPS] = { 0, };
++
++static const gchar *introspection_xml =
++	"<node>"
++	"  <interface name='org.freedesktop.Tracker3.Files'>"
++	"    <property name='ExtractorConfig' type='a{sv}' access='read' />"
++	"  </interface>"
++	"</node>";
++
++G_DEFINE_TYPE (TrackerFilesInterface, tracker_files_interface, G_TYPE_OBJECT)
++
++static void
++tracker_files_interface_init (TrackerFilesInterface *files_interface)
++{
++}
++
++static GVariant *
++handle_get_property (GDBusConnection  *connection,
++                     const gchar      *sender,
++                     const gchar      *object_path,
++                     const gchar      *interface_name,
++                     const gchar      *property_name,
++                     GError          **error,
++                     gpointer          user_data)
++{
++	TrackerFilesInterface *files_interface = user_data;
++
++	if (g_strcmp0 (object_path, "/org/freedesktop/Tracker3/Files") != 0 ||
++	    g_strcmp0 (interface_name, "org.freedesktop.Tracker3.Files") != 0) {
++		g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++		             "Wrong object/interface");
++		return NULL;
++	}
++
++	if (g_strcmp0 (property_name, "ExtractorConfig") == 0) {
++		GVariantBuilder builder;
++
++		g_variant_builder_init (&builder, G_VARIANT_TYPE ("a{sv}"));
++		g_variant_builder_add (&builder, "{sv}", "max-bytes",
++		                       g_settings_get_value (files_interface->settings, "max-bytes"));
++
++		return g_variant_builder_end (&builder);
++	} else {
++		g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++		             "Unknown property");
++		return NULL;
++	}
++}
++
++static void
++tracker_files_interface_constructed (GObject *object)
++{
++	TrackerFilesInterface *files_interface = TRACKER_FILES_INTERFACE (object);
++	GDBusInterfaceVTable vtable = { NULL, handle_get_property, NULL };
++	g_autoptr (GDBusNodeInfo) introspection_data = NULL;
++
++	G_OBJECT_CLASS (tracker_files_interface_parent_class)->constructed (object);
++
++	introspection_data = g_dbus_node_info_new_for_xml (introspection_xml, NULL);
++	files_interface->object_id =
++		g_dbus_connection_register_object (files_interface->connection,
++		                                   "/org/freedesktop/Tracker3/Files",
++		                                   introspection_data->interfaces[0],
++		                                   &vtable, object, NULL, NULL);
++
++	files_interface->settings = g_settings_new ("org.freedesktop.Tracker3.Extract");
++}
++
++static void
++tracker_files_interface_finalize (GObject *object)
++{
++	TrackerFilesInterface *files_interface = TRACKER_FILES_INTERFACE (object);
++
++	g_dbus_connection_unregister_object (files_interface->connection,
++	                                     files_interface->object_id);
++	g_clear_object (&files_interface->connection);
++	g_clear_object (&files_interface->settings);
++
++	G_OBJECT_CLASS (tracker_files_interface_parent_class)->finalize (object);
++}
++
++static void
++tracker_files_interface_set_property (GObject      *object,
++                                      guint         prop_id,
++                                      const GValue *value,
++                                      GParamSpec   *pspec)
++{
++	TrackerFilesInterface *files_interface = TRACKER_FILES_INTERFACE (object);
++
++	switch (prop_id) {
++	case PROP_CONNECTION:
++		files_interface->connection = g_value_dup_object (value);
++		break;
++	default:
++		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++		break;
++	}
++}
++
++static void
++tracker_files_interface_get_property (GObject    *object,
++                                      guint       prop_id,
++                                      GValue     *value,
++                                      GParamSpec *pspec)
++{
++	TrackerFilesInterface *files_interface = TRACKER_FILES_INTERFACE (object);
++
++	switch (prop_id) {
++	case PROP_CONNECTION:
++		g_value_set_object (value, files_interface->connection);
++		break;
++	default:
++		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++		break;
++	}
++}
++
++static void
++tracker_files_interface_class_init (TrackerFilesInterfaceClass *klass)
++{
++	GObjectClass *object_class = G_OBJECT_CLASS (klass);
++
++	object_class->constructed = tracker_files_interface_constructed;
++	object_class->finalize = tracker_files_interface_finalize;
++	object_class->set_property = tracker_files_interface_set_property;
++	object_class->get_property = tracker_files_interface_get_property;
++
++	props[PROP_CONNECTION] =
++		g_param_spec_object ("connection",
++		                     NULL, NULL,
++		                     G_TYPE_DBUS_CONNECTION,
++		                     G_PARAM_READWRITE |
++		                     G_PARAM_CONSTRUCT_ONLY |
++		                     G_PARAM_STATIC_STRINGS);
++
++	g_object_class_install_properties (object_class, N_PROPS, props);
++}
++
++TrackerFilesInterface *
++tracker_files_interface_new (GDBusConnection *connection)
++{
++	return g_object_new (TRACKER_TYPE_FILES_INTERFACE,
++	                     "connection", connection,
++	                     NULL);
++}
+diff --git a/src/miners/fs/tracker-files-interface.h b/src/miners/fs/tracker-files-interface.h
+new file mode 100644
+index 000000000..e040e41d0
+--- /dev/null
++++ b/src/miners/fs/tracker-files-interface.h
+@@ -0,0 +1,35 @@
++/*
++ * Copyright (C) 2023 Red Hat Inc.
++
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++ * Boston, MA  02110-1301, USA.
++ *
++ * Author: Carlos Garnacho <carlosg@gnome.org>
++ */
++
++#ifndef __TRACKER_FILES_INTERFACE_H__
++#define __TRACKER_FILES_INTERFACE_H__
++
++#include <gio/gio.h>
++
++#define TRACKER_TYPE_FILES_INTERFACE (tracker_files_interface_get_type ())
++G_DECLARE_FINAL_TYPE (TrackerFilesInterface,
++                      tracker_files_interface,
++                      TRACKER, FILES_INTERFACE,
++                      GObject)
++
++TrackerFilesInterface * tracker_files_interface_new (GDBusConnection *connection);
++
++#endif /* __TRACKER_FILES_INTERFACE_H__ */
+diff --git a/src/miners/fs/tracker-main.c b/src/miners/fs/tracker-main.c
+index f9ccca3aa..292480a0b 100644
+--- a/src/miners/fs/tracker-main.c
++++ b/src/miners/fs/tracker-main.c
+@@ -41,6 +41,7 @@
+ 
+ #include "tracker-config.h"
+ #include "tracker-miner-files.h"
++#include "tracker-files-interface.h"
+ 
+ #define ABOUT	  \
+ 	"Tracker " PACKAGE_VERSION "\n"
+@@ -967,6 +968,7 @@ main (gint argc, gchar *argv[])
+ 	GMemoryMonitor *memory_monitor;
+ #endif
+ 	gchar *domain_name, *dbus_name;
++	TrackerFilesInterface *files_interface;
+ 
+ 	main_loop = NULL;
+ 
+@@ -1022,6 +1024,8 @@ main (gint argc, gchar *argv[])
+ 		return EXIT_FAILURE;
+ 	}
+ 
++	files_interface = tracker_files_interface_new (connection);
++
+ 	/* Initialize logging */
+ 	config = tracker_config_new ();
+ 
+@@ -1188,6 +1192,8 @@ main (gint argc, gchar *argv[])
+ 		save_current_locale (domain_ontology);
+ 	}
+ 
++	g_object_unref (files_interface);
++
+ 	g_main_loop_unref (main_loop);
+ 	g_object_unref (config);
+ 
+diff --git a/src/tracker-extract/meson.build b/src/tracker-extract/meson.build
+index 88ce49fb9..0e1f92fe7 100644
+--- a/src/tracker-extract/meson.build
++++ b/src/tracker-extract/meson.build
+@@ -136,7 +136,6 @@ tracker_extract_priority_dbus = gnome.gdbus_codegen(
+   namespace: 'TrackerExtractDBus')
+ 
+ tracker_extract_sources = [
+-  'tracker-config.c',
+   'tracker-extract.c',
+   'tracker-extract-controller.c',
+   'tracker-extract-decorator.c',
+diff --git a/src/tracker-extract/tracker-config.c b/src/tracker-extract/tracker-config.c
+deleted file mode 100644
+index 426bba67c..000000000
+--- a/src/tracker-extract/tracker-config.c
++++ /dev/null
+@@ -1,289 +0,0 @@
+-/*
+- * Copyright (C) 2009, Nokia <ivan.frade@nokia.com>
+- * Copyright (C) 2014, Lanedo <martyn@lanedo.com>
+- *
+- * This library is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU Lesser General Public
+- * License as published by the Free Software Foundation; either
+- * version 2.1 of the License, or (at your option) any later version.
+- *
+- * This library is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * Lesser General Public License for more details.
+- *
+- * You should have received a copy of the GNU Lesser General Public
+- * License along with this library; if not, write to the
+- * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+- * Boston, MA  02110-1301, USA.
+- */
+-
+-#include "config-miners.h"
+-
+-#define G_SETTINGS_ENABLE_BACKEND
+-#include <gio/gsettingsbackend.h>
+-
+-#include <libtracker-miners-common/tracker-common.h>
+-
+-#include "tracker-config.h"
+-
+-#define CONFIG_SCHEMA "org.freedesktop.Tracker3.Extract"
+-#define CONFIG_PATH   "/org/freedesktop/tracker/extract/"
+-
+-static void     config_set_property         (GObject       *object,
+-                                             guint          param_id,
+-                                             const GValue  *value,
+-                                             GParamSpec    *pspec);
+-static void     config_get_property         (GObject       *object,
+-                                             guint          param_id,
+-                                             GValue        *value,
+-                                             GParamSpec    *pspec);
+-static void     config_finalize             (GObject       *object);
+-static void     config_constructed          (GObject       *object);
+-
+-enum {
+-	PROP_0,
+-	PROP_MAX_BYTES,
+-	PROP_TEXT_ALLOWLIST,
+-	PROP_WAIT_FOR_MINER_FS,
+-};
+-
+-G_DEFINE_TYPE (TrackerConfig, tracker_config, G_TYPE_SETTINGS);
+-
+-static void
+-tracker_config_class_init (TrackerConfigClass *klass)
+-{
+-	GObjectClass *object_class = G_OBJECT_CLASS (klass);
+-
+-	object_class->set_property = config_set_property;
+-	object_class->get_property = config_get_property;
+-	object_class->finalize     = config_finalize;
+-	object_class->constructed  = config_constructed;
+-
+-	/* General */
+-	g_object_class_install_property (object_class,
+-	                                 PROP_MAX_BYTES,
+-	                                 g_param_spec_int ("max-bytes",
+-	                                                   "Max Bytes",
+-	                                                   "Maximum number of UTF-8 bytes to extract per file [0->10485760]",
+-	                                                   0, 1024 * 1024 * 10,
+-	                                                   1024 * 1024,
+-	                                                   G_PARAM_READWRITE));
+-
+-	g_object_class_install_property (object_class,
+-	                                 PROP_TEXT_ALLOWLIST,
+-	                                 g_param_spec_boxed ("text-allowlist",
+-	                                                     "Text file allowlist",
+-	                                                     "Filename patterns for plain text documents that should be indexed",
+-	                                                     G_TYPE_STRV,
+-	                                                     G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+-	g_object_class_install_property (object_class,
+-	                                 PROP_WAIT_FOR_MINER_FS,
+-	                                 g_param_spec_boolean ("wait-for-miner-fs",
+-	                                                       "Wait for FS miner to be done before extracting",
+-	                                                       "%TRUE to wait for tracker-miner-fs is done before extracting. %FAlSE otherwise",
+-	                                                       FALSE,
+-	                                                       G_PARAM_READWRITE));
+-}
+-
+-static void
+-tracker_config_init (TrackerConfig *object)
+-{
+-}
+-
+-static void
+-config_set_property (GObject      *object,
+-                     guint         param_id,
+-                     const GValue *value,
+-                     GParamSpec   *pspec)
+-{
+-	switch (param_id) {
+-	/* We don't care about these... we don't save anyway. */
+-	case PROP_MAX_BYTES:
+-	case PROP_TEXT_ALLOWLIST:
+-	case PROP_WAIT_FOR_MINER_FS:
+-		break;
+-
+-	default:
+-		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, param_id, pspec);
+-		break;
+-	};
+-}
+-
+-static void
+-config_get_property (GObject    *object,
+-                     guint       param_id,
+-                     GValue     *value,
+-                     GParamSpec *pspec)
+-{
+-	TrackerConfig *config = TRACKER_CONFIG (object);
+-
+-	switch (param_id) {
+-	case PROP_MAX_BYTES:
+-		g_value_set_int (value,
+-		                 tracker_config_get_max_bytes (config));
+-		break;
+-
+-	case PROP_TEXT_ALLOWLIST:
+-		g_value_take_boxed (value, tracker_gslist_to_string_list (config->text_allowlist));
+-		break;
+-
+-	case PROP_WAIT_FOR_MINER_FS:
+-		g_value_set_boolean (value,
+-		                     tracker_config_get_wait_for_miner_fs (config));
+-		break;
+-
+-	default:
+-		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, param_id, pspec);
+-		break;
+-	};
+-}
+-
+-static void
+-config_set_text_allowlist_conveniences (TrackerConfig *config)
+-{
+-	GSList *l;
+-	GSList *patterns = NULL;
+-
+-	g_slist_foreach (config->text_allowlist_patterns,
+-	                 (GFunc) g_pattern_spec_free,
+-	                 NULL);
+-	g_slist_free (config->text_allowlist_patterns);
+-
+-	for (l = config->text_allowlist; l; l = l->next) {
+-		GPatternSpec *spec;
+-		const gchar *str = l->data;
+-
+-		if (str) {
+-			spec = g_pattern_spec_new (l->data);
+-			patterns = g_slist_prepend (patterns, spec);
+-		}
+-	}
+-
+-	config->text_allowlist_patterns = g_slist_reverse (patterns);
+-}
+-
+-static void
+-config_finalize (GObject *object)
+-{
+-	TrackerConfig *config = TRACKER_CONFIG (object);
+-
+-	g_slist_foreach (config->text_allowlist_patterns,
+-	                 (GFunc) g_pattern_spec_free,
+-	                 NULL);
+-	g_slist_free (config->text_allowlist);
+-
+-	(G_OBJECT_CLASS (tracker_config_parent_class)->finalize) (object);
+-
+-}
+-
+-static void
+-config_constructed (GObject *object)
+-{
+-	GSettings *settings;
+-
+-	(G_OBJECT_CLASS (tracker_config_parent_class)->constructed) (object);
+-
+-	settings = G_SETTINGS (object);
+-
+-	if (G_LIKELY (!g_getenv ("TRACKER_USE_CONFIG_FILES"))) {
+-		g_settings_delay (settings);
+-	}
+-
+-	/* Set up bindings:
+-	 *
+-	 * We don't bind the G_SETTINGS_BIND_SET because we don't want to save
+-	 * anything, ever, we only want to know about updates to the settings as
+-	 * they're changed externally. The only time this may be
+-	 * different is where we use the environment variable
+-	 * TRACKER_USE_CONFIG_FILES and we want to write a config
+-	 * file for convenience. But this is only necessary if the
+-	 * config is different to the default.
+-	 */
+-	g_settings_bind (settings, "wait-for-miner-fs", object, "wait-for-miner-fs", G_SETTINGS_BIND_GET);
+-
+-	/* Cache settings accessed from extractor modules, we don't want
+-	 * the GSettings object accessed within these as it may trigger
+-	 * unintended open() calls.
+-	 */
+-	TRACKER_CONFIG (settings)->max_bytes = g_settings_get_int (settings, "max-bytes");
+-	TRACKER_CONFIG (settings)->text_allowlist = tracker_string_list_to_gslist (g_settings_get_strv (settings, "text-allowlist"), -1);
+-
+-	config_set_text_allowlist_conveniences (TRACKER_CONFIG (settings));
+-}
+-
+-TrackerConfig *
+-tracker_config_new (void)
+-{
+-	TrackerConfig *config = NULL;
+-
+-	/* FIXME: should we unset GSETTINGS_BACKEND env var? */
+-
+-	if (G_UNLIKELY (g_getenv ("TRACKER_USE_CONFIG_FILES"))) {
+-		GSettingsBackend *backend;
+-		gchar *filename, *basename;
+-		gboolean need_to_save;
+-
+-		basename = g_strdup_printf ("%s.cfg", g_get_prgname ());
+-		filename = g_build_filename (g_get_user_config_dir (), "tracker", basename, NULL);
+-		g_free (basename);
+-
+-		need_to_save = g_file_test (filename, G_FILE_TEST_EXISTS) == FALSE;
+-
+-		backend = g_keyfile_settings_backend_new (filename, CONFIG_PATH, "General");
+-		g_info ("Using config file '%s'", filename);
+-		g_free (filename);
+-
+-		config = g_object_new (TRACKER_TYPE_CONFIG,
+-		                       "backend", backend,
+-		                       "schema-id", CONFIG_SCHEMA,
+-		                       "path", CONFIG_PATH,
+-		                       NULL);
+-		g_object_unref (backend);
+-
+-		if (need_to_save) {
+-			g_info ("  Config file does not exist, using default values...");
+-		}
+-	} else {
+-		config = g_object_new (TRACKER_TYPE_CONFIG,
+-		                       "schema-id", CONFIG_SCHEMA,
+-		                       "path", CONFIG_PATH,
+-		                       NULL);
+-	}
+-
+-	return config;
+-}
+-
+-gint
+-tracker_config_get_max_bytes (TrackerConfig *config)
+-{
+-	g_return_val_if_fail (TRACKER_IS_CONFIG (config), 0);
+-
+-	return config->max_bytes;
+-}
+-
+-GSList *
+-tracker_config_get_text_allowlist (TrackerConfig *config)
+-{
+-	g_return_val_if_fail (TRACKER_IS_CONFIG (config), NULL);
+-
+-	return config->text_allowlist;
+-}
+-
+-gboolean
+-tracker_config_get_wait_for_miner_fs (TrackerConfig *config)
+-{
+-	g_return_val_if_fail (TRACKER_IS_CONFIG (config), FALSE);
+-
+-	return g_settings_get_boolean (G_SETTINGS (config), "wait-for-miner-fs");
+-}
+-
+-
+-/*
+- * Convenience functions
+- */
+-GSList *
+-tracker_config_get_text_allowlist_patterns (TrackerConfig *config)
+-{
+-	return config->text_allowlist_patterns;
+-}
+diff --git a/src/tracker-extract/tracker-config.h b/src/tracker-extract/tracker-config.h
+deleted file mode 100644
+index 18dc292b0..000000000
+--- a/src/tracker-extract/tracker-config.h
++++ /dev/null
+@@ -1,69 +0,0 @@
+-/*
+- * Copyright (C) 2009, Nokia <ivan.frade@nokia.com>
+- *
+- * This library is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU Lesser General Public
+- * License as published by the Free Software Foundation; either
+- * version 2.1 of the License, or (at your option) any later version.
+- *
+- * This library is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * Lesser General Public License for more details.
+- *
+- * You should have received a copy of the GNU Lesser General Public
+- * License along with this library; if not, write to the
+- * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+- * Boston, MA  02110-1301, USA.
+- */
+-
+-#ifndef __TRACKER_EXTRACT_CONFIG_H__
+-#define __TRACKER_EXTRACT_CONFIG_H__
+-
+-#include <glib-object.h>
+-
+-G_BEGIN_DECLS
+-
+-#define TRACKER_TYPE_CONFIG         (tracker_config_get_type ())
+-#define TRACKER_CONFIG(o)           (G_TYPE_CHECK_INSTANCE_CAST ((o), TRACKER_TYPE_CONFIG, TrackerConfig))
+-#define TRACKER_CONFIG_CLASS(k)     (G_TYPE_CHECK_CLASS_CAST ((k), TRACKER_TYPE_CONFIG, TrackerConfigClass))
+-#define TRACKER_IS_CONFIG(o)        (G_TYPE_CHECK_INSTANCE_TYPE ((o), TRACKER_TYPE_CONFIG))
+-#define TRACKER_IS_CONFIG_CLASS(k)  (G_TYPE_CHECK_CLASS_TYPE ((k), TRACKER_TYPE_CONFIG))
+-#define TRACKER_CONFIG_GET_CLASS(o) (G_TYPE_INSTANCE_GET_CLASS ((o), TRACKER_TYPE_CONFIG, TrackerConfigClass))
+-
+-typedef struct TrackerConfig      TrackerConfig;
+-typedef struct TrackerConfigClass TrackerConfigClass;
+-
+-struct TrackerConfig {
+-	GSettings parent;
+-	gint max_bytes;
+-	GSList *text_allowlist;
+-
+-	/* Convenience data */
+-	GSList *text_allowlist_patterns;
+-};
+-
+-struct TrackerConfigClass {
+-	GSettingsClass parent_class;
+-};
+-
+-GType          tracker_config_get_type                (void) G_GNUC_CONST;
+-
+-TrackerConfig *tracker_config_new                     (void);
+-gint           tracker_config_get_max_bytes           (TrackerConfig *config);
+-GSList *       tracker_config_get_text_allowlist      (TrackerConfig *config);
+-gboolean       tracker_config_get_wait_for_miner_fs   (TrackerConfig *config);
+-
+-/*
+- * Convenience functions:
+- */
+-
+-/* The _patterns() APIs return GPatternSpec pointers for basename
+- * pattern matching.
+- */
+-GSList *       tracker_config_get_text_allowlist_patterns        (TrackerConfig *config);
+-
+-G_END_DECLS
+-
+-#endif /* __TRACKER_EXTRACT_CONFIG_H__ */
+-
+diff --git a/src/tracker-extract/tracker-extract-controller.c b/src/tracker-extract/tracker-extract-controller.c
+index 1543a7237..404f1f13c 100644
+--- a/src/tracker-extract/tracker-extract-controller.c
++++ b/src/tracker-extract/tracker-extract-controller.c
+@@ -32,6 +32,7 @@ struct TrackerExtractControllerPrivate {
+ 	TrackerDecorator *decorator;
+ 	GCancellable *cancellable;
+ 	GDBusConnection *connection;
++	GDBusProxy *miner_proxy;
+ 	guint object_id;
+ 	gint paused;
+ };
+@@ -49,6 +50,53 @@ static const gchar *introspection_xml =
+ 
+ G_DEFINE_TYPE_WITH_PRIVATE (TrackerExtractController, tracker_extract_controller, G_TYPE_OBJECT)
+ 
++static void
++update_extract_config (TrackerExtractController *controller,
++                       GDBusProxy               *proxy)
++{
++	TrackerExtractControllerPrivate *priv;
++	GVariantIter iter;
++	g_autoptr (GVariant) v = NULL;
++	GVariant *value;
++	gchar *key;
++
++	priv = tracker_extract_controller_get_instance_private (controller);
++
++	v = g_dbus_proxy_get_cached_property (proxy, "ExtractorConfig");
++	if (!v)
++		return;
++
++	g_variant_iter_init (&iter, v);
++
++	while (g_variant_iter_next (&iter, "{sv}", &key, &value)) {
++		if (g_strcmp0 (key, "max-bytes") == 0 &&
++		    g_variant_is_of_type (value, G_VARIANT_TYPE_INT32)) {
++			TrackerExtract *extract = NULL;
++			gint max_bytes;
++
++			max_bytes = g_variant_get_int32 (value);
++			g_object_get (priv->decorator, "extractor", &extract, NULL);
++
++			if (extract) {
++				tracker_extract_set_max_text (extract, max_bytes);
++				g_object_unref (extract);
++			}
++		}
++
++		g_free (key);
++		g_variant_unref (value);
++	}
++}
++
++static void
++miner_properties_changed_cb (GDBusProxy *proxy,
++                             GVariant   *changed_properties,
++                             GStrv       invalidated_properties,
++                             gpointer    user_data)
++{
++	update_extract_config (user_data, proxy);
++}
++
+ static void
+ decorator_raise_error_cb (TrackerDecorator         *decorator,
+                           GFile                    *file,
+@@ -112,6 +160,19 @@ tracker_extract_controller_constructed (GObject *object)
+ 		                                   &interface_vtable,
+ 		                                   object,
+ 		                                   NULL, NULL);
++
++	self->priv->miner_proxy = g_dbus_proxy_new_sync (self->priv->connection,
++	                                                 G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
++	                                                 NULL,
++	                                                 "org.freedesktop.Tracker3.Miner.Files",
++	                                                 "/org/freedesktop/Tracker3/Files",
++	                                                 "org.freedesktop.Tracker3.Files",
++	                                                 NULL, NULL);
++	if (self->priv->miner_proxy) {
++		g_signal_connect (self->priv->miner_proxy, "g-properties-changed",
++		                  G_CALLBACK (miner_properties_changed_cb), object);
++		update_extract_config (self, self->priv->miner_proxy);
++	}
+ }
+ 
+ static void
+diff --git a/src/tracker-extract/tracker-extract-epub.c b/src/tracker-extract/tracker-extract-epub.c
+index 0e4af5b16..ec7d12593 100644
+--- a/src/tracker-extract/tracker-extract-epub.c
++++ b/src/tracker-extract/tracker-extract-epub.c
+@@ -561,12 +561,12 @@ extract_opf_path (const gchar *uri)
+ }
+ 
+ static gchar *
+-extract_opf_contents (const gchar *uri,
+-                      const gchar *content_prefix,
+-                      GList       *content_files)
++extract_opf_contents (TrackerExtractInfo *info,
++                      const gchar        *uri,
++                      const gchar        *content_prefix,
++                      GList              *content_files)
+ {
+ 	OPFContentData content_data = { 0 };
+-	TrackerConfig *config;
+ 	GError *error = NULL;
+ 	GList *l;
+ 	GMarkupParser xml_parser = {
+@@ -575,10 +575,8 @@ extract_opf_contents (const gchar *uri,
+ 		NULL, NULL
+ 	};
+ 
+-	config = tracker_main_get_config ();
+-
+ 	content_data.contents = g_string_new ("");
+-	content_data.limit = (gsize) tracker_config_get_max_bytes (config);
++	content_data.limit = (gsize) tracker_extract_info_get_max_text (info);
+ 
+ 	g_debug ("Extracting up to %" G_GSIZE_FORMAT " bytes of content", content_data.limit);
+ 
+@@ -611,8 +609,9 @@ extract_opf_contents (const gchar *uri,
+ }
+ 
+ static TrackerResource *
+-extract_opf (const gchar          *uri,
+-             const gchar          *opf_path)
++extract_opf (TrackerExtractInfo *info,
++             const gchar        *uri,
++             const gchar        *opf_path)
+ {
+ 	TrackerResource *ebook;
+ 	GMarkupParseContext *context;
+@@ -652,7 +651,7 @@ extract_opf (const gchar          *uri,
+ 	}
+ 
+ 	dirname = g_path_get_dirname (opf_path);
+-	contents = extract_opf_contents (uri, dirname, data->pages);
++	contents = extract_opf_contents (info, uri, dirname, data->pages);
+ 	g_free (dirname);
+ 
+ 	if (contents && *contents) {
+@@ -683,7 +682,7 @@ tracker_extract_get_metadata (TrackerExtractInfo  *info,
+ 		return FALSE;
+ 	}
+ 
+-	ebook = extract_opf (uri, opf_path);
++	ebook = extract_opf (info, uri, opf_path);
+ 	g_free (opf_path);
+ 	g_free (uri);
+ 
+diff --git a/src/tracker-extract/tracker-extract-html.c b/src/tracker-extract/tracker-extract-html.c
+index a446b4a54..242a2c42c 100644
+--- a/src/tracker-extract/tracker-extract-html.c
++++ b/src/tracker-extract/tracker-extract-html.c
+@@ -234,7 +234,6 @@ tracker_extract_get_metadata (TrackerExtractInfo  *info,
+ {
+ 	TrackerResource *metadata;
+ 	GFile *file;
+-	TrackerConfig *config;
+ 	htmlDocPtr doc;
+ 	parser_data pd;
+ 	gchar *filename;
+@@ -284,8 +283,7 @@ tracker_extract_get_metadata (TrackerExtractInfo  *info,
+ 	pd.plain_text = g_string_new (NULL);
+ 	pd.title = g_string_new (NULL);
+ 
+-	config = tracker_main_get_config ();
+-	pd.n_bytes_remaining = tracker_config_get_max_bytes (config);
++	pd.n_bytes_remaining = tracker_extract_info_get_max_text (info);
+ 
+ 	filename = g_file_get_path (file);
+ 	doc = htmlSAXParseFile (filename, NULL, &handler, &pd);
+diff --git a/src/tracker-extract/tracker-extract-msoffice-xml.c b/src/tracker-extract/tracker-extract-msoffice-xml.c
+index 31d8a7880..86f48822e 100644
+--- a/src/tracker-extract/tracker-extract-msoffice-xml.c
++++ b/src/tracker-extract/tracker-extract-msoffice-xml.c
+@@ -806,7 +806,6 @@ tracker_extract_get_metadata (TrackerExtractInfo  *extract_info,
+ 	MsOfficeXMLParserInfo info = { 0 };
+ 	MsOfficeXMLFileType file_type;
+ 	TrackerResource *metadata;
+-	TrackerConfig *config;
+ 	GMarkupParseContext *context = NULL;
+ 	GError *inner_error = NULL;
+ 	GFile *file;
+@@ -822,9 +821,6 @@ tracker_extract_get_metadata (TrackerExtractInfo  *extract_info,
+ 	/* Get current Content Type */
+ 	file_type = msoffice_xml_get_file_type (uri);
+ 
+-	/* Setup conf */
+-	config = tracker_main_get_config ();
+-
+ 	g_debug ("Extracting MsOffice XML format...");
+ 
+ 	metadata = tracker_resource_new (NULL);
+@@ -840,7 +836,7 @@ tracker_extract_get_metadata (TrackerExtractInfo  *extract_info,
+ 	info.content = NULL;
+ 	info.title_already_set = FALSE;
+ 	info.generator_already_set = FALSE;
+-	info.bytes_pending = tracker_config_get_max_bytes (config);
++	info.bytes_pending = tracker_extract_info_get_max_text (extract_info);
+ 
+ 	/* Create content-type parser context */
+ 	context = g_markup_parse_context_new (&content_types_parser,
+diff --git a/src/tracker-extract/tracker-extract-msoffice.c b/src/tracker-extract/tracker-extract-msoffice.c
+index 06220671b..92f81f9de 100644
+--- a/src/tracker-extract/tracker-extract-msoffice.c
++++ b/src/tracker-extract/tracker-extract-msoffice.c
+@@ -1619,7 +1619,6 @@ tracker_extract_get_metadata (TrackerExtractInfo  *info,
+                               GError             **error)
+ {
+ 	TrackerResource *metadata;
+-	TrackerConfig *config;
+ 	GsfInfile *infile = NULL;
+ 	gchar *content = NULL, *uri;
+ 	gboolean is_encrypted = FALSE;
+@@ -1669,8 +1668,7 @@ tracker_extract_get_metadata (TrackerExtractInfo  *info,
+ 	extract_summary (metadata, infile, uri);
+ 
+ 	/* Set max bytes to read from content */
+-	config = tracker_main_get_config ();
+-	max_bytes = tracker_config_get_max_bytes (config);
++	max_bytes = tracker_extract_info_get_max_text (info);
+ 
+ 	if (g_ascii_strcasecmp (mime_used, "application/msword") == 0) {
+ 		/* Word file */
+diff --git a/src/tracker-extract/tracker-extract-oasis.c b/src/tracker-extract/tracker-extract-oasis.c
+index b29ae5971..3d2a4fa46 100644
+--- a/src/tracker-extract/tracker-extract-oasis.c
++++ b/src/tracker-extract/tracker-extract-oasis.c
+@@ -171,7 +171,6 @@ tracker_extract_get_metadata (TrackerExtractInfo  *extract_info,
+                               GError             **error)
+ {
+ 	TrackerResource *metadata;
+-	TrackerConfig *config;
+ 	ODTMetadataParseInfo info = { 0 };
+ 	ODTFileType file_type;
+ 	GFile *file;
+@@ -196,9 +195,6 @@ tracker_extract_get_metadata (TrackerExtractInfo  *extract_info,
+ 	file = tracker_extract_info_get_file (extract_info);
+ 	uri = g_file_get_uri (file);
+ 
+-	/* Setup conf */
+-	config = tracker_main_get_config ();
+-
+ 	g_debug ("Extracting OASIS metadata and contents from '%s'", uri);
+ 
+ 	/* First, parse metadata */
+@@ -233,7 +229,7 @@ tracker_extract_get_metadata (TrackerExtractInfo  *extract_info,
+ 
+ 	/* Extract content with the given limitations */
+ 	extract_oasis_content (uri,
+-	                       tracker_config_get_max_bytes (config),
++	                       tracker_extract_info_get_max_text (extract_info),
+ 	                       file_type,
+ 	                       metadata);
+ 
+diff --git a/src/tracker-extract/tracker-extract-pdf.c b/src/tracker-extract/tracker-extract-pdf.c
+index 40c0c98e4..4706f082a 100644
+--- a/src/tracker-extract/tracker-extract-pdf.c
++++ b/src/tracker-extract/tracker-extract-pdf.c
+@@ -285,7 +285,6 @@ G_MODULE_EXPORT gboolean
+ tracker_extract_get_metadata (TrackerExtractInfo  *info,
+                               GError             **error)
+ {
+-	TrackerConfig *config;
+ 	time_t creation_date;
+ 	GError *inner_error = NULL;
+ 	TrackerResource *metadata;
+@@ -541,8 +540,7 @@ tracker_extract_get_metadata (TrackerExtractInfo  *info,
+ 
+ 	tracker_resource_set_int64 (metadata, "nfo:pageCount", poppler_document_get_n_pages(document));
+ 
+-	config = tracker_main_get_config ();
+-	n_bytes = tracker_config_get_max_bytes (config);
++	n_bytes = tracker_extract_info_get_max_text (info);
+ 	content = extract_content_text (document, n_bytes);
+ 
+ 	if (content) {
+diff --git a/src/tracker-extract/tracker-extract-text.c b/src/tracker-extract/tracker-extract-text.c
+index ecbfdf4d1..c2ef33fc6 100644
+--- a/src/tracker-extract/tracker-extract-text.c
++++ b/src/tracker-extract/tracker-extract-text.c
+@@ -81,19 +81,17 @@ tracker_extract_get_metadata (TrackerExtractInfo  *info,
+                               GError             **error)
+ {
+ 	TrackerResource *metadata;
+-	TrackerConfig *config;
+ 	GFile *file;
+ 	gchar *content = NULL;
+ 	GError *inner_error = NULL;
+ 
+-	config = tracker_main_get_config ();
+ 	file = tracker_extract_info_get_file (info);
+ 
+ 	metadata = tracker_resource_new (NULL);
+ 	tracker_resource_add_uri (metadata, "rdf:type", "nfo:PlainTextDocument");
+ 
+ 	content = get_file_content (tracker_extract_info_get_file (info),
+-	                            tracker_config_get_max_bytes (config),
++	                            tracker_extract_info_get_max_text (info),
+ 	                            &inner_error);
+ 
+ 	if (inner_error != NULL) {
+diff --git a/src/tracker-extract/tracker-extract.c b/src/tracker-extract/tracker-extract.c
+index 29c5df384..0d29a1990 100644
+--- a/src/tracker-extract/tracker-extract.c
++++ b/src/tracker-extract/tracker-extract.c
+@@ -47,6 +47,8 @@ G_DEFINE_QUARK (TrackerExtractError, tracker_extract_error)
+ 
+ #define DEADLINE_SECONDS 30
+ 
++#define DEFAULT_MAX_TEXT 1048576
++
+ extern gboolean debug;
+ 
+ typedef struct {
+@@ -59,6 +61,8 @@ typedef struct {
+ 	GHashTable *statistics_data;
+ 	GList *running_tasks;
+ 
++	gint max_text;
++
+ 	/* used to maintain the running tasks
+ 	 * and stats from different threads
+ 	 */
+@@ -84,6 +88,7 @@ typedef struct {
+ 	gchar *file;
+ 	gchar *mimetype;
+ 	const gchar *graph;
++	gint max_text;
+ 
+ 	TrackerExtractMetadataFunc func;
+ 	GModule *module;
+@@ -124,6 +129,7 @@ tracker_extract_init (TrackerExtract *object)
+ 
+ 	priv = TRACKER_EXTRACT_GET_PRIVATE (object);
+ 	priv->single_thread_extractors = g_hash_table_new (NULL, NULL);
++	priv->max_text = DEFAULT_MAX_TEXT;
+ 
+ #ifdef G_ENABLE_DEBUG
+ 	if (TRACKER_DEBUG_CHECK (STATISTICS)) {
+@@ -287,7 +293,7 @@ get_file_metadata (TrackerExtractTask  *task,
+ 	*info_out = NULL;
+ 
+ 	file = g_file_new_for_uri (task->file);
+-	info = tracker_extract_info_new (file, task->mimetype, task->graph);
++	info = tracker_extract_info_new (file, task->mimetype, task->graph, task->max_text);
+ 	g_object_unref (file);
+ 
+ 	if (!task->mimetype || !*task->mimetype) {
+@@ -341,6 +347,7 @@ extract_task_new (TrackerExtract *extract,
+                   GAsyncResult   *res,
+                   GError        **error)
+ {
++	TrackerExtractPrivate *priv = TRACKER_EXTRACT_GET_PRIVATE (extract);
+ 	TrackerExtractTask *task;
+ 	gchar *mimetype_used;
+ 
+@@ -377,6 +384,7 @@ extract_task_new (TrackerExtract *extract,
+ 	task->file = g_strdup (uri);
+ 	task->mimetype = mimetype_used;
+ 	task->extract = extract;
++	task->max_text = priv->max_text;
+ 
+ 	if (task->res) {
+ 		GSource *source;
+@@ -776,3 +784,12 @@ tracker_extract_file_finish (TrackerExtract  *extract,
+ 
+ 	return g_task_propagate_pointer (G_TASK (res), error);
+ }
++
++void
++tracker_extract_set_max_text (TrackerExtract *extract,
++                              gint            max_text)
++{
++	TrackerExtractPrivate *priv = TRACKER_EXTRACT_GET_PRIVATE (extract);
++
++	priv->max_text = max_text;
++}
+diff --git a/src/tracker-extract/tracker-extract.h b/src/tracker-extract/tracker-extract.h
+index bd88c3f9d..ff573b9d1 100644
+--- a/src/tracker-extract/tracker-extract.h
++++ b/src/tracker-extract/tracker-extract.h
+@@ -74,6 +74,9 @@ TrackerExtractInfo *
+ void            tracker_extract_dbus_start              (TrackerExtract         *extract);
+ void            tracker_extract_dbus_stop               (TrackerExtract         *extract);
+ 
++void            tracker_extract_set_max_text            (TrackerExtract *extract,
++                                                         gint            max_text);
++
+ /* Not DBus API */
+ void            tracker_extract_get_metadata_by_cmdline (TrackerExtract             *object,
+                                                          const gchar                *path,
+diff --git a/src/tracker-extract/tracker-main.c b/src/tracker-extract/tracker-main.c
+index 422c53044..74245ce0c 100644
+--- a/src/tracker-extract/tracker-main.c
++++ b/src/tracker-extract/tracker-main.c
+@@ -40,7 +40,6 @@
+ 
+ #include <libtracker-miners-common/tracker-common.h>
+ 
+-#include "tracker-config.h"
+ #include "tracker-main.h"
+ #include "tracker-extract.h"
+ #include "tracker-extract-controller.h"
+@@ -74,8 +73,6 @@ static gboolean version;
+ static gchar *domain_ontology_name = NULL;
+ static guint shutdown_timeout_id = 0;
+ 
+-static TrackerConfig *config;
+-
+ static GOptionEntry entries[] = {
+ 	{ "file", 'f', 0,
+ 	  G_OPTION_ARG_FILENAME, &filename,
+@@ -129,26 +126,8 @@ initialize_priority_and_scheduling (void)
+ 	}
+ }
+ 
+-static void
+-log_option_values (TrackerConfig *config)
+-{
+-#ifdef G_ENABLE_DEBUG
+-	if (TRACKER_DEBUG_CHECK (CONFIG)) {
+-		g_message ("General options:");
+-		g_message ("  Max bytes (per file)  .................  %d",
+-		           tracker_config_get_max_bytes (config));
+-	}
+-#endif
+-}
+-
+-TrackerConfig *
+-tracker_main_get_config (void)
+-{
+-	return config;
+-}
+-
+ static int
+-run_standalone (TrackerConfig *config)
++run_standalone (void)
+ {
+ 	TrackerExtract *object;
+ 	GFile *file;
+@@ -318,20 +297,14 @@ main (int argc, char *argv[])
+ 		return EXIT_FAILURE;
+ 	}
+ 
+-	config = tracker_config_new ();
+-
+-	/* Extractor command line arguments */
+-	log_option_values (config);
+-
+ 	/* Set conditions when we use stand alone settings */
+ 	if (filename) {
+-		return run_standalone (config);
++		return run_standalone ();
+ 	}
+ 
+ 	extract = tracker_extract_new (TRUE, force_module);
+ 
+ 	if (!extract) {
+-		g_object_unref (config);
+ 		return EXIT_FAILURE;
+ 	}
+ 
+@@ -353,7 +326,6 @@ main (int argc, char *argv[])
+ 
+ 	if (error) {
+ 		g_critical ("Could not start decorator: %s\n", error->message);
+-		g_object_unref (config);
+ 		return EXIT_FAILURE;
+ 	}
+ 
+@@ -362,7 +334,6 @@ main (int argc, char *argv[])
+ 		g_critical ("Could not create miner DBus proxy: %s\n", error->message);
+ 		g_error_free (error);
+ 		g_object_unref (decorator);
+-		g_object_unref (config);
+ 		return EXIT_FAILURE;
+ 	}
+ 
+@@ -431,7 +402,5 @@ main (int argc, char *argv[])
+ 	tracker_sparql_connection_close (sparql_connection);
+ 	g_object_unref (sparql_connection);
+ 
+-	g_object_unref (config);
+-
+ 	return EXIT_SUCCESS;
+ }
+diff --git a/src/tracker-extract/tracker-main.h b/src/tracker-extract/tracker-main.h
+index 4af2e3e06..5ee12c697 100644
+--- a/src/tracker-extract/tracker-main.h
++++ b/src/tracker-extract/tracker-main.h
+@@ -21,13 +21,8 @@
+ #ifndef __TRACKER_MAIN_H__
+ #define __TRACKER_MAIN_H__
+ 
+-#include "tracker-config.h"
+-
+ G_BEGIN_DECLS
+ 
+-/* Enables getting the config object from extractors */
+-TrackerConfig    *tracker_main_get_config         (void);
+-
+ G_END_DECLS
+ 
+ #endif /* __TRACKER_MAIN_H__ */
+diff --git a/tests/libtracker-extract/tracker-extract-info-test.c b/tests/libtracker-extract/tracker-extract-info-test.c
+index 736350dc1..3f0d9fb94 100644
+--- a/tests/libtracker-extract/tracker-extract-info-test.c
++++ b/tests/libtracker-extract/tracker-extract-info-test.c
+@@ -29,7 +29,7 @@ test_extract_info_setters (void)
+ 
+         file = g_file_new_for_path ("./imaginary-file-2");
+ 
+-        info = tracker_extract_info_new (file, "imaginary/mime", NULL);
++        info = tracker_extract_info_new (file, "imaginary/mime", NULL, 100);
+         info_ref = tracker_extract_info_ref (info);
+ 
+         g_assert_true (g_file_equal (file, tracker_extract_info_get_file (info)));
+@@ -50,7 +50,7 @@ test_extract_info_empty_objects (void)
+ 
+         file = g_file_new_for_path ("./imaginary-file");
+ 
+-        info = tracker_extract_info_new (file, "imaginary/mime", NULL);
++        info = tracker_extract_info_new (file, "imaginary/mime", NULL, 100);
+         info_ref = tracker_extract_info_ref (info);
+ 
+         tracker_extract_info_unref (info_ref);
+-- 
+2.43.0
+
+
+From e79257cb054275d00003238d1ce08a25fa659d41 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Sun, 24 Sep 2023 19:18:52 +0200
+Subject: [PATCH 06/23] tracker-extract: Avoid file access for persistence
+
+Use a memfd_create() FD, maintained and kept alive by tracker-miner-fs-3.
+This FD is obtained through D-Bus, and used for temporary storage. Since
+processing of files in the extractor is largely linear nowadays, this
+also simplifies the persistent storage to store a single file.
+---
+ config-miners.h.meson.in                      |   3 +
+ meson.build                                   |   1 +
+ src/miners/fs/tracker-files-interface.c       |  72 +++++-
+ .../tracker-extract-controller.c              |  65 ++++-
+ .../tracker-extract-controller.h              |   5 +-
+ .../tracker-extract-decorator.c               |  60 ++++-
+ .../tracker-extract-decorator.h               |  10 +-
+ .../tracker-extract-persistence.c             | 241 +++++-------------
+ .../tracker-extract-persistence.h             |  18 +-
+ src/tracker-extract/tracker-main.c            |   9 +-
+ 10 files changed, 278 insertions(+), 206 deletions(-)
+
+diff --git a/config-miners.h.meson.in b/config-miners.h.meson.in
+index 767521ea6..53764aeb8 100644
+--- a/config-miners.h.meson.in
++++ b/config-miners.h.meson.in
+@@ -62,6 +62,9 @@
+ /* Define to 1 if you have the `strnlen' function. */
+ #mesondefine HAVE_STRNLEN
+ 
++/* Define to 1 if you have the `memfd_create' function. */
++#mesondefine HAVE_MEMFD_CREATE
++
+ /* Define if we have UPOWER */
+ #mesondefine HAVE_UPOWER
+ 
+diff --git a/meson.build b/meson.build
+index 6f1d41e5a..f04a0edf5 100644
+--- a/meson.build
++++ b/meson.build
+@@ -375,6 +375,7 @@ conf.set('HAVE_GETLINE', cc.has_function('getline', prefix : '#include <stdio.h>
+ conf.set('HAVE_POSIX_FADVISE', cc.has_function('posix_fadvise', prefix : '#include <fcntl.h>'))
+ conf.set('HAVE_STATVFS64', cc.has_header_symbol('sys/statvfs.h', 'statvfs64', args: '-D_LARGEFILE64_SOURCE'))
+ conf.set('HAVE_STRNLEN', cc.has_function('strnlen', prefix : '#include <string.h>'))
++conf.set('HAVE_MEMFD_CREATE', cc.has_function('memfd_create', prefix : '#define _GNU_SOURCE\n#include <sys/mman.h>'))
+ 
+ conf.set('LOCALEDIR', '"@0@/@1@"'.format(get_option('prefix'), get_option('localedir')))
+ conf.set('SHAREDIR', '"@0@/@1@"'.format(get_option('prefix'), get_option('datadir')))
+diff --git a/src/miners/fs/tracker-files-interface.c b/src/miners/fs/tracker-files-interface.c
+index 150e40eab..69c2531ca 100644
+--- a/src/miners/fs/tracker-files-interface.c
++++ b/src/miners/fs/tracker-files-interface.c
+@@ -23,12 +23,16 @@
+ 
+ #include "tracker-files-interface.h"
+ 
++#include <gio/gunixfdlist.h>
++#include <sys/mman.h>
++
+ struct _TrackerFilesInterface
+ {
+ 	GObject parent_instance;
+ 	GDBusConnection *connection;
+ 	GSettings *settings;
+ 	guint object_id;
++	int fd;
+ };
+ 
+ enum {
+@@ -43,6 +47,9 @@ static const gchar *introspection_xml =
+ 	"<node>"
+ 	"  <interface name='org.freedesktop.Tracker3.Files'>"
+ 	"    <property name='ExtractorConfig' type='a{sv}' access='read' />"
++	"    <method name='GetPersistenceStorage'>"
++	"      <arg type='h' direction='out' />"
++	"    </method>"
+ 	"  </interface>"
+ 	"</node>";
+ 
+@@ -53,6 +60,66 @@ tracker_files_interface_init (TrackerFilesInterface *files_interface)
+ {
+ }
+ 
++static void
++handle_method_call (GDBusConnection       *connection,
++                    const gchar           *sender,
++                    const gchar           *object_path,
++                    const gchar           *interface_name,
++                    const gchar           *method_name,
++                    GVariant              *parameters,
++                    GDBusMethodInvocation *invocation,
++                    gpointer               user_data)
++{
++	TrackerFilesInterface *files_interface = user_data;
++
++	if (g_strcmp0 (method_name, "GetPersistenceStorage") == 0) {
++		GVariant *out_parameters;
++		g_autoptr (GUnixFDList) fd_list = NULL;
++		g_autoptr (GError) error = NULL;
++		int idx;
++
++		if (files_interface->fd <= 0) {
++#ifdef HAVE_MEMFD_CREATE
++			files_interface->fd = memfd_create ("extract-persistent-storage",
++			                                    MFD_CLOEXEC);
++#else
++			g_autofree gchar *path = NULL;
++
++			path = g_strdup_printf ("%s/tracker-persistence.XXXXXX",
++			                        g_get_tmp_dir ());
++			files_interface->fd = g_mkstemp_full (path, 0, 0600);
++			unlink (path);
++#endif
++
++			if (files_interface->fd < 0) {
++				g_dbus_method_invocation_return_error (invocation,
++				                                       G_IO_ERROR,
++				                                       G_IO_ERROR_FAILED,
++				                                       "Could not create memfd");
++				return;
++			}
++		}
++
++		fd_list = g_unix_fd_list_new ();
++		idx = g_unix_fd_list_append (fd_list, files_interface->fd, &error);
++
++		if (error) {
++			g_dbus_method_invocation_return_gerror (invocation, error);
++		} else {
++			out_parameters = g_variant_new ("(h)", idx);
++			g_dbus_method_invocation_return_value_with_unix_fd_list (invocation,
++			                                                         out_parameters,
++			                                                         fd_list);
++		}
++	} else {
++		g_dbus_method_invocation_return_error (invocation,
++		                                       G_DBUS_ERROR,
++		                                       G_DBUS_ERROR_UNKNOWN_METHOD,
++		                                       "Unknown method %s",
++		                                       method_name);
++	}
++}
++
+ static GVariant *
+ handle_get_property (GDBusConnection  *connection,
+                      const gchar      *sender,
+@@ -90,7 +157,7 @@ static void
+ tracker_files_interface_constructed (GObject *object)
+ {
+ 	TrackerFilesInterface *files_interface = TRACKER_FILES_INTERFACE (object);
+-	GDBusInterfaceVTable vtable = { NULL, handle_get_property, NULL };
++	GDBusInterfaceVTable vtable = { handle_method_call, handle_get_property, NULL };
+ 	g_autoptr (GDBusNodeInfo) introspection_data = NULL;
+ 
+ 	G_OBJECT_CLASS (tracker_files_interface_parent_class)->constructed (object);
+@@ -115,6 +182,9 @@ tracker_files_interface_finalize (GObject *object)
+ 	g_clear_object (&files_interface->connection);
+ 	g_clear_object (&files_interface->settings);
+ 
++	if (files_interface->fd)
++		close (files_interface->fd);
++
+ 	G_OBJECT_CLASS (tracker_files_interface_parent_class)->finalize (object);
+ }
+ 
+diff --git a/src/tracker-extract/tracker-extract-controller.c b/src/tracker-extract/tracker-extract-controller.c
+index 404f1f13c..96ceafcab 100644
+--- a/src/tracker-extract/tracker-extract-controller.c
++++ b/src/tracker-extract/tracker-extract-controller.c
+@@ -23,13 +23,17 @@
+ 
+ #include "tracker-main.h"
+ 
++#include <gio/gunixfdlist.h>
++
+ enum {
+ 	PROP_DECORATOR = 1,
+ 	PROP_CONNECTION,
++	PROP_PERSISTENCE,
+ };
+ 
+ struct TrackerExtractControllerPrivate {
+ 	TrackerDecorator *decorator;
++	TrackerExtractPersistence *persistence;
+ 	GCancellable *cancellable;
+ 	GDBusConnection *connection;
+ 	GDBusProxy *miner_proxy;
+@@ -97,6 +101,38 @@ miner_properties_changed_cb (GDBusProxy *proxy,
+ 	update_extract_config (user_data, proxy);
+ }
+ 
++static gboolean
++set_up_persistence (TrackerExtractController  *controller,
++                    GCancellable              *cancellable,
++                    GError                   **error)
++{
++	TrackerExtractControllerPrivate *priv =
++		tracker_extract_controller_get_instance_private (controller);
++	g_autoptr (GUnixFDList) out_fd_list = NULL;
++	g_autoptr (GVariant) variant = NULL;
++	int idx, fd;
++
++	variant = g_dbus_proxy_call_with_unix_fd_list_sync (priv->miner_proxy,
++	                                                    "GetPersistenceStorage",
++	                                                    NULL,
++	                                                    G_DBUS_CALL_FLAGS_NO_AUTO_START,
++	                                                    -1,
++	                                                    NULL,
++	                                                    &out_fd_list,
++	                                                    cancellable,
++	                                                    error);
++	if (!variant)
++		return FALSE;
++
++	g_variant_get (variant, "(h)", &idx);
++	fd = g_unix_fd_list_get (out_fd_list, idx, error);
++	if (fd < 0)
++		return FALSE;
++
++	tracker_extract_persistence_set_fd (priv->persistence, fd);
++	return TRUE;
++}
++
+ static void
+ decorator_raise_error_cb (TrackerDecorator         *decorator,
+                           GFile                    *file,
+@@ -173,6 +209,8 @@ tracker_extract_controller_constructed (GObject *object)
+ 		                  G_CALLBACK (miner_properties_changed_cb), object);
+ 		update_extract_config (self, self->priv->miner_proxy);
+ 	}
++
++	set_up_persistence (self, NULL, NULL);
+ }
+ 
+ static void
+@@ -190,6 +228,12 @@ tracker_extract_controller_get_property (GObject    *object,
+ 	case PROP_CONNECTION:
+ 		g_value_set_object (value, self->priv->connection);
+ 		break;
++	case PROP_PERSISTENCE:
++		g_value_set_object (value, self->priv->persistence);
++		break;
++	default:
++		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, param_id, pspec);
++		break;
+ 	}
+ }
+ 
+@@ -209,6 +253,12 @@ tracker_extract_controller_set_property (GObject      *object,
+ 	case PROP_CONNECTION:
+ 		self->priv->connection = g_value_dup_object (value);
+ 		break;
++	case PROP_PERSISTENCE:
++		self->priv->persistence = g_value_dup_object (value);
++		break;
++	default:
++		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, param_id, pspec);
++		break;
+ 	}
+ }
+ 
+@@ -223,6 +273,7 @@ tracker_extract_controller_dispose (GObject *object)
+ 	}
+ 
+ 	g_clear_object (&self->priv->decorator);
++	g_clear_object (&self->priv->persistence);
+ 
+ 	G_OBJECT_CLASS (tracker_extract_controller_parent_class)->dispose (object);
+ }
+@@ -255,6 +306,14 @@ tracker_extract_controller_class_init (TrackerExtractControllerClass *klass)
+ 	                                                      G_PARAM_STATIC_STRINGS |
+ 	                                                      G_PARAM_READWRITE |
+ 	                                                      G_PARAM_CONSTRUCT_ONLY));
++	g_object_class_install_property (object_class,
++	                                 PROP_PERSISTENCE,
++	                                 g_param_spec_object ("persistence",
++	                                                      NULL, NULL,
++	                                                      TRACKER_TYPE_EXTRACT_PERSISTENCE,
++	                                                      G_PARAM_STATIC_STRINGS |
++	                                                      G_PARAM_READWRITE |
++	                                                      G_PARAM_CONSTRUCT_ONLY));
+ }
+ 
+ static void
+@@ -264,13 +323,15 @@ tracker_extract_controller_init (TrackerExtractController *self)
+ }
+ 
+ TrackerExtractController *
+-tracker_extract_controller_new (TrackerDecorator *decorator,
+-                                GDBusConnection  *connection)
++tracker_extract_controller_new (TrackerDecorator          *decorator,
++                                GDBusConnection           *connection,
++                                TrackerExtractPersistence *persistence)
+ {
+ 	g_return_val_if_fail (TRACKER_IS_DECORATOR (decorator), NULL);
+ 
+ 	return g_object_new (TRACKER_TYPE_EXTRACT_CONTROLLER,
+ 	                     "decorator", decorator,
+ 	                     "connection", connection,
++	                     "persistence", persistence,
+ 	                     NULL);
+ }
+diff --git a/src/tracker-extract/tracker-extract-controller.h b/src/tracker-extract/tracker-extract-controller.h
+index 7d8a70816..3ba85751c 100644
+--- a/src/tracker-extract/tracker-extract-controller.h
++++ b/src/tracker-extract/tracker-extract-controller.h
+@@ -47,8 +47,9 @@ struct TrackerExtractControllerClass {
+ };
+ 
+ GType                      tracker_extract_controller_get_type (void) G_GNUC_CONST;
+-TrackerExtractController * tracker_extract_controller_new      (TrackerDecorator *decorator,
+-                                                                GDBusConnection  *connection);
++TrackerExtractController * tracker_extract_controller_new      (TrackerDecorator          *decorator,
++                                                                GDBusConnection           *connection,
++                                                                TrackerExtractPersistence *persistence);
+ 
+ G_END_DECLS
+ 
+diff --git a/src/tracker-extract/tracker-extract-decorator.c b/src/tracker-extract/tracker-extract-decorator.c
+index d9b515fd6..347217e08 100644
+--- a/src/tracker-extract/tracker-extract-decorator.c
++++ b/src/tracker-extract/tracker-extract-decorator.c
+@@ -26,7 +26,9 @@
+ #include "tracker-extract-persistence.h"
+ 
+ enum {
+-	PROP_EXTRACTOR = 1
++	PROP_0,
++	PROP_EXTRACTOR,
++	PROP_PERSISTENCE,
+ };
+ 
+ #define MAX_EXTRACTING_FILES 1
+@@ -87,6 +89,12 @@ tracker_extract_decorator_get_property (GObject    *object,
+ 	case PROP_EXTRACTOR:
+ 		g_value_set_object (value, priv->extractor);
+ 		break;
++	case PROP_PERSISTENCE:
++		g_value_set_object (value, priv->persistence);
++		break;
++	default:
++		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, param_id, pspec);
++		break;
+ 	}
+ }
+ 
+@@ -104,6 +112,12 @@ tracker_extract_decorator_set_property (GObject      *object,
+ 	case PROP_EXTRACTOR:
+ 		priv->extractor = g_value_dup_object (value);
+ 		break;
++	case PROP_PERSISTENCE:
++		priv->persistence = g_value_dup_object (value);
++		break;
++	default:
++		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, param_id, pspec);
++		break;
+ 	}
+ }
+ 
+@@ -121,6 +135,7 @@ tracker_extract_decorator_finalize (GObject *object)
+ 		g_timer_destroy (priv->timer);
+ 
+ 	g_clear_object (&priv->index_proxy);
++	g_clear_object (&priv->persistence);
+ 
+ 	G_OBJECT_CLASS (tracker_extract_decorator_parent_class)->finalize (object);
+ }
+@@ -161,7 +176,7 @@ get_metadata_cb (TrackerExtract *extract,
+ 	priv = tracker_extract_decorator_get_instance_private (TRACKER_EXTRACT_DECORATOR (data->decorator));
+ 	info = tracker_extract_file_finish (extract, result, &error);
+ 
+-	tracker_extract_persistence_remove_file (priv->persistence, data->file);
++	tracker_extract_persistence_set_file (priv->persistence, NULL);
+ 
+ 	if (data->cancellable && data->signal_id != 0) {
+ 		g_cancellable_disconnect (data->cancellable, data->signal_id);
+@@ -230,7 +245,7 @@ task_cancellable_cancelled_cb (GCancellable *cancellable,
+ 	 * this as a failed operation.
+ 	 */
+ 	priv = tracker_extract_decorator_get_instance_private (TRACKER_EXTRACT_DECORATOR (data->decorator));
+-	tracker_extract_persistence_remove_file (priv->persistence, data->file);
++	tracker_extract_persistence_set_file (priv->persistence, NULL);
+ 	uri = g_file_get_uri (data->file);
+ 
+ 	g_debug ("Cancelled task for '%s' was currently being "
+@@ -301,7 +316,7 @@ decorator_next_item_cb (TrackerDecorator *decorator,
+ 
+ 	g_debug ("Extracting metadata for '%s'", tracker_decorator_info_get_url (info));
+ 
+-	tracker_extract_persistence_add_file (priv->persistence, data->file);
++	tracker_extract_persistence_set_file (priv->persistence, data->file);
+ 
+ 	g_set_object (&data->cancellable, g_task_get_cancellable (task));
+ 
+@@ -364,6 +379,22 @@ tracker_extract_decorator_resumed (TrackerMiner *miner)
+ 	decorator_get_next_file (TRACKER_DECORATOR (miner));
+ }
+ 
++static void
++tracker_extract_decorator_started (TrackerMiner *miner)
++{
++	TrackerExtractDecorator *decorator = TRACKER_EXTRACT_DECORATOR (miner);
++	TrackerExtractDecoratorPrivate *priv =
++		tracker_extract_decorator_get_instance_private (decorator);
++	GFile *file;
++
++	file = tracker_extract_persistence_get_file (priv->persistence);
++
++	if (file)
++		decorator_ignore_file (file, decorator, "Crash/hang handling file", NULL);
++
++	TRACKER_MINER_CLASS (tracker_extract_decorator_parent_class)->started (miner);
++}
++
+ static void
+ tracker_extract_decorator_items_available (TrackerDecorator *decorator)
+ {
+@@ -424,6 +455,7 @@ tracker_extract_decorator_class_init (TrackerExtractDecoratorClass *klass)
+ 
+ 	miner_class->paused = tracker_extract_decorator_paused;
+ 	miner_class->resumed = tracker_extract_decorator_resumed;
++	miner_class->started = tracker_extract_decorator_started;
+ 
+ 	decorator_class->items_available = tracker_extract_decorator_items_available;
+ 	decorator_class->finished = tracker_extract_decorator_finished;
+@@ -438,6 +470,14 @@ tracker_extract_decorator_class_init (TrackerExtractDecoratorClass *klass)
+ 	                                                      G_PARAM_READWRITE |
+ 	                                                      G_PARAM_CONSTRUCT_ONLY |
+ 	                                                      G_PARAM_STATIC_STRINGS));
++	g_object_class_install_property (object_class,
++	                                 PROP_PERSISTENCE,
++	                                 g_param_spec_object ("persistence",
++	                                                      NULL, NULL,
++	                                                      TRACKER_TYPE_EXTRACT_PERSISTENCE,
++	                                                      G_PARAM_READWRITE |
++	                                                      G_PARAM_CONSTRUCT_ONLY |
++	                                                      G_PARAM_STATIC_STRINGS));
+ }
+ 
+ static void
+@@ -583,8 +623,6 @@ tracker_extract_decorator_initable_init (GInitable     *initable,
+ 		ret = FALSE;
+ 	}
+ 
+-	priv->persistence = tracker_extract_persistence_initialize (persistence_ignore_file,
+-	                                                            decorator);
+ out:
+ 	g_clear_object (&conn);
+ 
+@@ -599,14 +637,16 @@ tracker_extract_decorator_initable_iface_init (GInitableIface *iface)
+ }
+ 
+ TrackerDecorator *
+-tracker_extract_decorator_new (TrackerSparqlConnection  *connection,
+-                               TrackerExtract           *extract,
+-                               GCancellable             *cancellable,
+-                               GError                  **error)
++tracker_extract_decorator_new (TrackerSparqlConnection    *connection,
++                               TrackerExtract             *extract,
++			       TrackerExtractPersistence  *persistence,
++                               GCancellable               *cancellable,
++                               GError                    **error)
+ {
+ 	return g_initable_new (TRACKER_TYPE_EXTRACT_DECORATOR,
+ 	                       cancellable, error,
+ 	                       "connection", connection,
+ 	                       "extractor", extract,
++	                       "persistence", persistence,
+ 	                       NULL);
+ }
+diff --git a/src/tracker-extract/tracker-extract-decorator.h b/src/tracker-extract/tracker-extract-decorator.h
+index 8cbf74891..b77d4fb62 100644
+--- a/src/tracker-extract/tracker-extract-decorator.h
++++ b/src/tracker-extract/tracker-extract-decorator.h
+@@ -24,6 +24,7 @@
+ #include <libtracker-miner/tracker-miner.h>
+ 
+ #include "tracker-extract.h"
++#include "tracker-extract-persistence.h"
+ 
+ G_BEGIN_DECLS
+ 
+@@ -47,10 +48,11 @@ struct TrackerExtractDecoratorClass {
+ 
+ GType              tracker_extract_decorator_get_type (void) G_GNUC_CONST;
+ 
+-TrackerDecorator * tracker_extract_decorator_new (TrackerSparqlConnection  *connection,
+-                                                  TrackerExtract           *extractor,
+-                                                  GCancellable             *cancellable,
+-                                                  GError                  **error);
++TrackerDecorator * tracker_extract_decorator_new (TrackerSparqlConnection   *connection,
++                                                  TrackerExtract            *extractor,
++                                                  TrackerExtractPersistence *persistence,
++                                                  GCancellable              *cancellable,
++                                                  GError                   **error);
+ 
+ G_END_DECLS
+ 
+diff --git a/src/tracker-extract/tracker-extract-persistence.c b/src/tracker-extract/tracker-extract-persistence.c
+index bf356bc4f..995be2596 100644
+--- a/src/tracker-extract/tracker-extract-persistence.c
++++ b/src/tracker-extract/tracker-extract-persistence.c
+@@ -23,217 +23,108 @@ typedef struct _TrackerExtractPersistencePrivate TrackerExtractPersistencePrivat
+ 
+ struct _TrackerExtractPersistencePrivate
+ {
+-	GFile *tmp_dir;
++	int fd;
+ };
+ 
+ G_DEFINE_TYPE_WITH_PRIVATE (TrackerExtractPersistence, tracker_extract_persistence, G_TYPE_OBJECT)
+ 
+ static void
+-tracker_extract_persistence_class_init (TrackerExtractPersistenceClass *klass)
++tracker_extract_persistence_finalize (GObject *object)
+ {
++	TrackerExtractPersistence *persistence =
++		TRACKER_EXTRACT_PERSISTENCE (object);
++	TrackerExtractPersistencePrivate *priv =
++		tracker_extract_persistence_get_instance_private (persistence);
++
++	if (priv->fd > 0)
++		close (priv->fd);
++
++	G_OBJECT_CLASS (tracker_extract_persistence_parent_class)->finalize (object);
+ }
+ 
+ static void
+-tracker_extract_persistence_init (TrackerExtractPersistence *persistence)
++tracker_extract_persistence_class_init (TrackerExtractPersistenceClass *klass)
+ {
+-	TrackerExtractPersistencePrivate *priv;
+-	gchar *dirname, *tmp_path;
+-
+-	priv = tracker_extract_persistence_get_instance_private (persistence);
+-
+-	dirname = g_strdup_printf ("tracker-extract-3-files.%d", getuid ());
+-	tmp_path = g_build_filename (g_get_tmp_dir (), dirname, NULL);
+-	g_free (dirname);
++	GObjectClass *object_class = G_OBJECT_CLASS (klass);
+ 
+-	if (g_mkdir_with_parents (tmp_path, 0700) != 0) {
+-		g_critical ("The directory %s could not be created, or has the wrong permissions",
+-		            tmp_path);
+-		g_assert_not_reached ();
+-	}
+-
+-	priv->tmp_dir = g_file_new_for_path (tmp_path);
+-	g_free (tmp_path);
++	object_class->finalize = tracker_extract_persistence_finalize;
+ }
+ 
+-static GFile *
+-persistence_create_symlink_file (TrackerExtractPersistence *persistence,
+-                                 GFile                     *file)
++static void
++tracker_extract_persistence_init (TrackerExtractPersistence *persistence)
+ {
+-	TrackerExtractPersistencePrivate *priv;
+-	gchar *path, *md5;
+-	GFile *link_file;
+-
+-	priv = tracker_extract_persistence_get_instance_private (persistence);
+-	path = g_file_get_path (file);
+-	md5 = g_compute_checksum_for_string (G_CHECKSUM_MD5, path, -1);
+-	link_file = g_file_get_child (priv->tmp_dir, md5);
+-
+-	g_free (path);
+-	g_free (md5);
+-
+-	return link_file;
+ }
+ 
+-static GFile *
+-persistence_symlink_get_file (GFileInfo *info)
++TrackerExtractPersistence *
++tracker_extract_persistence_new (void)
+ {
+-	const gchar *symlink_name, *symlink_target;
+-	gchar *md5;
+-	GFile *file = NULL;
+-
+-	symlink_name = g_file_info_get_name (info);
+-	symlink_target = g_file_info_get_symlink_target (info);
+-
+-	if (!g_path_is_absolute (symlink_target)) {
+-		g_critical ("Symlink paths must be absolute, '%s' points to '%s'",
+-		            symlink_name, symlink_target);
+-		return NULL;
+-	}
+-
+-	md5 = g_compute_checksum_for_string (G_CHECKSUM_MD5, symlink_target, -1);
+-
+-	if (g_strcmp0 (symlink_name, md5) == 0) {
+-		file = g_file_new_for_path (symlink_target);
+-	} else {
+-		g_critical ("path MD5 for '%s' doesn't match with symlink '%s'",
+-		            symlink_target, symlink_name);
+-	}
+-
+-	g_free (md5);
+-
+-	return file;
++	return g_object_new (TRACKER_TYPE_EXTRACT_PERSISTENCE,
++	                     NULL);
+ }
+ 
+-static gboolean
+-persistence_store_file (TrackerExtractPersistence *persistence,
+-                        GFile                     *file)
++void
++tracker_extract_persistence_set_fd (TrackerExtractPersistence *persistence,
++                                    int                        fd)
+ {
+-	GError *error = NULL;
+-	gboolean success;
+-	GFile *link_file;
+-	gchar *path;
+-
+-	path = g_file_get_path (file);
+-	link_file = persistence_create_symlink_file (persistence, file);
++	TrackerExtractPersistencePrivate *priv =
++		tracker_extract_persistence_get_instance_private (persistence);
+ 
+-	success = g_file_make_symbolic_link (link_file, path, NULL, &error);
+-
+-	if (!success) {
+-		g_warning ("Could not save '%s' into failsafe persistence store: %s",
+-		           path, error ? error->message : "no error given");
+-		g_clear_error (&error);
+-	}
+-
+-	g_object_unref (link_file);
+-	g_free (path);
+-
+-	return success;
++	if (priv->fd > 0)
++		close (priv->fd);
++	priv->fd = fd;
+ }
+ 
+-static gboolean
+-persistence_remove_file (TrackerExtractPersistence *persistence,
+-                         GFile                     *file)
++void
++tracker_extract_persistence_set_file (TrackerExtractPersistence *persistence,
++                                      GFile                     *file)
+ {
+-	GError *error = NULL;
+-	GFile *link_file;
+-	gboolean success;
+-
+-	link_file = persistence_create_symlink_file (persistence, file);
+-	success = g_file_delete (link_file, NULL, &error);
++	TrackerExtractPersistencePrivate *priv =
++		tracker_extract_persistence_get_instance_private (persistence);
++	g_autofree gchar *path = NULL;
++	int len, written = 0, retval;
+ 
+-	if (!success) {
+-		gchar *path = g_file_get_path (file);
++	g_return_if_fail (TRACKER_IS_EXTRACT_PERSISTENCE (persistence));
++	g_return_if_fail (!file || G_IS_FILE (file));
+ 
+-		g_warning ("Could not delete '%s' from failsafe persistence store",
+-		           path);
+-		g_free (path);
++	if (file) {
++		path = g_file_get_path (file);
++	} else {
++		path = g_strdup ("");
+ 	}
+ 
+-	g_object_unref (link_file);
++	/* Write also the trailing \0 */
++	len = strlen (path) + 1;
+ 
+-	return success;
+-}
++	lseek (priv->fd, 0, SEEK_SET);
+ 
+-static void
+-persistence_retrieve_files (TrackerExtractPersistence *persistence,
+-                            TrackerFileRecoveryFunc    ignore_func,
+-                            gpointer                   user_data)
+-{
+-	TrackerExtractPersistencePrivate *priv;
+-	GFileEnumerator *enumerator;
+-	GFileInfo *info;
+-
+-	priv = tracker_extract_persistence_get_instance_private (persistence);
+-	enumerator = g_file_enumerate_children (priv->tmp_dir,
+-	                                        G_FILE_ATTRIBUTE_STANDARD_NAME ","
+-	                                        G_FILE_ATTRIBUTE_STANDARD_SYMLINK_TARGET,
+-	                                        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+-	                                        NULL, NULL);
+-	if (!enumerator)
+-		return;
+-
+-	while ((info = g_file_enumerator_next_file (enumerator, NULL, NULL)) != NULL) {
+-		GFile *file, *symlink_file;
+-
+-		symlink_file = g_file_enumerator_get_child (enumerator, info);
+-		file = persistence_symlink_get_file (info);
+-
+-		if (!file) {
+-			/* If we got here, persistence_symlink_get_file() already emitted a g_critical */
+-			g_object_unref (symlink_file);
+-			g_object_unref (info);
+-			continue;
+-		}
+-
+-		/* Delete the symlink.
+-		 */
+-		g_file_delete (symlink_file, NULL, NULL);
+-		g_object_unref (symlink_file);
+-
+-		/* Trigger ignore func for the symlink target */
+-		ignore_func (file, user_data);
+-
+-		g_object_unref (file);
+-		g_object_unref (info);
+-	}
++	while (TRUE) {
++		retval = write (priv->fd, &path[written], len - written);
++		if (retval < 0)
++			break;
+ 
+-	g_file_enumerator_close (enumerator, NULL, NULL);
+-	g_object_unref (enumerator);
+-}
+-
+-TrackerExtractPersistence *
+-tracker_extract_persistence_initialize (TrackerFileRecoveryFunc ignore_func,
+-                                        gpointer                user_data)
+-{
+-	static TrackerExtractPersistence *persistence = NULL;
+-
+-	if (!persistence) {
+-		persistence = g_object_new (TRACKER_TYPE_EXTRACT_PERSISTENCE,
+-		                            NULL);
+-		persistence_retrieve_files (persistence,
+-		                            ignore_func,
+-		                            user_data);
++		written += retval;
++		if (written >= len)
++			break;
+ 	}
+-
+-	return persistence;
+ }
+ 
+-void
+-tracker_extract_persistence_add_file (TrackerExtractPersistence *persistence,
+-                                      GFile                     *file)
++GFile *
++tracker_extract_persistence_get_file (TrackerExtractPersistence *persistence)
+ {
+-	g_return_if_fail (TRACKER_IS_EXTRACT_PERSISTENCE (persistence));
+-	g_return_if_fail (G_IS_FILE (file));
++	TrackerExtractPersistencePrivate *priv =
++		tracker_extract_persistence_get_instance_private (persistence);
++	gchar buf[2048];
++	int len;
+ 
+-	persistence_store_file (persistence, file);
+-}
++	g_return_val_if_fail (TRACKER_IS_EXTRACT_PERSISTENCE (persistence), NULL);
+ 
+-void
+-tracker_extract_persistence_remove_file (TrackerExtractPersistence *persistence,
+-                                         GFile                     *file)
+-{
+-	g_return_if_fail (TRACKER_IS_EXTRACT_PERSISTENCE (persistence));
+-	g_return_if_fail (G_IS_FILE (file));
++	lseek (priv->fd, 0, SEEK_SET);
++	len = read (priv->fd, buf, sizeof (buf));
++	if (len <= 0)
++		return NULL;
++	if (buf[0] == '\0')
++		return NULL;
+ 
+-	persistence_remove_file (persistence, file);
++	buf[len - 1] = '\0';
++	return g_file_new_for_path (buf);
+ }
+diff --git a/src/tracker-extract/tracker-extract-persistence.h b/src/tracker-extract/tracker-extract-persistence.h
+index b935b0898..c1d498ef7 100644
+--- a/src/tracker-extract/tracker-extract-persistence.h
++++ b/src/tracker-extract/tracker-extract-persistence.h
+@@ -34,9 +34,6 @@ G_BEGIN_DECLS
+ typedef struct _TrackerExtractPersistence TrackerExtractPersistence;
+ typedef struct _TrackerExtractPersistenceClass TrackerExtractPersistenceClass;
+ 
+-typedef void (* TrackerFileRecoveryFunc) (GFile    *file,
+-                                          gpointer  user_data);
+-
+ struct _TrackerExtractPersistence
+ {
+ 	GObject parent_instance;
+@@ -49,14 +46,15 @@ struct _TrackerExtractPersistenceClass
+ 
+ GType tracker_extract_persistence_get_type (void) G_GNUC_CONST;
+ 
+-TrackerExtractPersistence *
+-     tracker_extract_persistence_initialize (TrackerFileRecoveryFunc     ignore_func,
+-                                             gpointer                    user_data);
++TrackerExtractPersistence * tracker_extract_persistence_new (void);
++
++void tracker_extract_persistence_set_fd (TrackerExtractPersistence *persistence,
++                                         int                        fd);
++
++GFile * tracker_extract_persistence_get_file (TrackerExtractPersistence *persistence);
+ 
+-void tracker_extract_persistence_add_file    (TrackerExtractPersistence *persistence,
+-                                              GFile                     *file);
+-void tracker_extract_persistence_remove_file (TrackerExtractPersistence *persistence,
+-                                              GFile                     *file);
++void tracker_extract_persistence_set_file (TrackerExtractPersistence *persistence,
++                                           GFile                     *file);
+ 
+ G_END_DECLS
+ 
+diff --git a/src/tracker-extract/tracker-main.c b/src/tracker-extract/tracker-main.c
+index 74245ce0c..90527038a 100644
+--- a/src/tracker-extract/tracker-main.c
++++ b/src/tracker-extract/tracker-main.c
+@@ -44,6 +44,7 @@
+ #include "tracker-extract.h"
+ #include "tracker-extract-controller.h"
+ #include "tracker-extract-decorator.h"
++#include "tracker-extract-persistence.h"
+ 
+ #ifdef THREAD_ENABLE_TRACE
+ #warning Main thread traces enabled
+@@ -232,6 +233,7 @@ main (int argc, char *argv[])
+ 	GMainLoop *my_main_loop;
+ 	GDBusConnection *connection;
+ 	TrackerMinerProxy *proxy;
++	TrackerExtractPersistence *persistence;
+ 	TrackerSparqlConnection *sparql_connection;
+ 	TrackerDomainOntology *domain_ontology;
+ 	gchar *dbus_name, *miner_dbus_name;
+@@ -322,7 +324,9 @@ main (int argc, char *argv[])
+ 		return EXIT_FAILURE;
+ 	}
+ 
+-	decorator = tracker_extract_decorator_new (sparql_connection, extract, NULL, &error);
++	persistence = tracker_extract_persistence_new ();
++
++	decorator = tracker_extract_decorator_new (sparql_connection, extract, persistence, NULL, &error);
+ 
+ 	if (error) {
+ 		g_critical ("Could not start decorator: %s\n", error->message);
+@@ -344,7 +348,7 @@ main (int argc, char *argv[])
+ 
+ 	tracker_locale_sanity_check ();
+ 
+-	controller = tracker_extract_controller_new (decorator, connection);
++	controller = tracker_extract_controller_new (decorator, connection, persistence);
+ 
+ 	/* Request DBus name */
+ 	dbus_name = tracker_domain_ontology_get_domain (domain_ontology, DBUS_NAME_SUFFIX);
+@@ -396,6 +400,7 @@ main (int argc, char *argv[])
+ 	g_object_unref (extract);
+ 	g_object_unref (decorator);
+ 	g_object_unref (controller);
++	g_object_unref (persistence);
+ 	g_object_unref (proxy);
+ 	g_object_unref (connection);
+ 	tracker_domain_ontology_unref (domain_ontology);
+-- 
+2.43.0
+
+
+From 6e9027780e3d9d07a362b72afdef3f1c9c54e6a0 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Sun, 24 Sep 2023 23:27:56 +0200
+Subject: [PATCH 07/23] tracker-extract: Disable GstRegistry forking
+
+This is going nowhere with the sandbox. Also disable some more
+needless GST plugins.
+---
+ src/tracker-extract/tracker-extract-gstreamer.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/tracker-extract/tracker-extract-gstreamer.c b/src/tracker-extract/tracker-extract-gstreamer.c
+index ea1985aa2..7399a6ff1 100644
+--- a/src/tracker-extract/tracker-extract-gstreamer.c
++++ b/src/tracker-extract/tracker-extract-gstreamer.c
+@@ -1410,7 +1410,9 @@ tracker_extract_module_init (GError **error)
+ 	/* Lifted from totem-video-thumbnailer */
+ 	const gchar *blocklisted[] = {
+ 		"bcmdec",
+-		"fluiddec",
++		"camerabin",
++		"fluidsynthmidi",
++		"libcamera",
+ 		"vaapi",
+ 		"video4linux2",
+ 		"nvmpegvideodec",
+@@ -1427,6 +1429,7 @@ tracker_extract_module_init (GError **error)
+ 	GstRegistry *registry;
+ 	guint i;
+ 
++	gst_registry_fork_set_enabled (FALSE);
+ 	gst_init (NULL, NULL);
+ 	registry = gst_registry_get ();
+ 
+-- 
+2.43.0
+
+
+From 7f3912067c82ec8466369b47b5df6e033b6f10eb Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Fri, 22 Sep 2023 23:26:38 +0200
+Subject: [PATCH 08/23] libtracker-miners-common: Extend seccomp rules
+
+The plan is to extend the seccomp jail so it affects the full
+tracker-extract-3 process. With the changes in the previous
+commits we've removed the need for filesystem write access.
+
+We have some remaining outliers, that we're largely sorting
+out with rules to error out softly (instead of through SIGSYS).
+The only new allowed syscalls are fstatfs and prlimit64 with a
+NULL new_limit struct.
+---
+ .../tracker-seccomp.c                         | 20 +++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index 6b1c35450..1182bfd86 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -143,6 +143,7 @@ tracker_seccomp_init (void)
+ 	ALLOW_RULE (lstat);
+ 	ALLOW_RULE (lstat64);
+ 	ALLOW_RULE (statx);
++	ALLOW_RULE (fstatfs);
+ 	ALLOW_RULE (access);
+ 	ALLOW_RULE (faccessat);
+ 	ALLOW_RULE (faccessat2);
+@@ -224,6 +225,22 @@ tracker_seccomp_init (void)
+ 	ALLOW_RULE (getpeername);
+ 	ALLOW_RULE (shutdown);
+ 
++	ERROR_RULE (inotify_init1, EINVAL);
++	ERROR_RULE (inotify_init, EINVAL);
++
++	ERROR_RULE (mkdir, EPERM);
++	ERROR_RULE (rename, EPERM);
++	ERROR_RULE (unlink, EPERM);
++	ERROR_RULE (ioctl, EBADF);
++	ERROR_RULE (bind, EACCES);
++	ERROR_RULE (setsockopt, EBADF);
++	ERROR_RULE (sched_getattr, EPERM);
++
++	/* Allow prlimit64, only if no new limits are being set */
++	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(prlimit64), 1,
++	                      SCMP_CMP(2, SCMP_CMP_EQ, 0)) < 0)
++		goto out;
++
+ 	/* Special requirements for socket/socketpair, only on AF_UNIX/AF_LOCAL */
+ 	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
+ 	                      SCMP_CMP(0, SCMP_CMP_EQ, AF_UNIX)) < 0)
+@@ -231,6 +248,9 @@ tracker_seccomp_init (void)
+ 	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
+ 	                      SCMP_CMP(0, SCMP_CMP_EQ, AF_LOCAL)) < 0)
+ 		goto out;
++	if (seccomp_rule_add (ctx, SCMP_ACT_ERRNO (EACCES), SCMP_SYS(socket), 1,
++	                      SCMP_CMP(0, SCMP_CMP_EQ, AF_NETLINK)) < 0)
++		goto out;
+ 	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(socketpair), 1,
+ 	                      SCMP_CMP(0, SCMP_CMP_EQ, AF_UNIX)) < 0)
+ 		goto out;
+-- 
+2.43.0
+
+
+From 84f04dd8636a01e30e5a24c8e619a0c522548863 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Fri, 22 Sep 2023 23:14:38 +0200
+Subject: [PATCH 09/23] tracker-extract: Extend seccomp jail to full process
+
+Currently, our main thread is exempted from the seccomp jail.
+This was so we could do some menial tasks (e.g. persistence handling
+to recover from runtime errors, or error reports on failed extraction)
+without caring much about plugging seccomp holes.
+
+It may be preferable to extend the seccomp jail to the full process
+instead, so do that. Now the only thing happening prior to setting
+up the seccomp jail is the setting up of nice/scheduler/ioprio
+priorities. Everything else, and every thread spawned afterwards is
+covered by seccomp.
+
+Related: https://gitlab.gnome.org/GNOME/tracker-miners/-/issues/277
+---
+ src/tracker-extract/tracker-extract.c |  8 --------
+ src/tracker-extract/tracker-main.c    | 24 ++++++++++++++++--------
+ 2 files changed, 16 insertions(+), 16 deletions(-)
+
+diff --git a/src/tracker-extract/tracker-extract.c b/src/tracker-extract/tracker-extract.c
+index 0d29a1990..8edaf5274 100644
+--- a/src/tracker-extract/tracker-extract.c
++++ b/src/tracker-extract/tracker-extract.c
+@@ -30,8 +30,6 @@
+ #include <gio/gunixinputstream.h>
+ #include <gio/gunixfdlist.h>
+ 
+-#include <libtracker-miners-common/tracker-common.h>
+-
+ #include <libtracker-extract/tracker-extract.h>
+ 
+ #include "tracker-extract.h"
+@@ -538,9 +536,6 @@ get_metadata (TrackerExtractTask *task)
+ static gpointer
+ single_thread_get_metadata (GAsyncQueue *queue)
+ {
+-	if (!tracker_seccomp_init ())
+-		g_assert_not_reached ();
+-
+ 	while (TRUE) {
+ 		TrackerExtractTask *task;
+ 
+@@ -703,9 +698,6 @@ tracker_extract_get_metadata_by_cmdline (TrackerExtract             *object,
+ 	                                                          NULL,
+ 	                                                          &task->func);
+ 
+-	if (!tracker_seccomp_init ())
+-		g_assert_not_reached ();
+-
+ 	if (!filter_module (object, task->module) &&
+ 	    get_file_metadata (task, &info, NULL)) {
+ 		resource = tracker_extract_info_get_resource (info);
+diff --git a/src/tracker-extract/tracker-main.c b/src/tracker-extract/tracker-main.c
+index 90527038a..b5cf53fee 100644
+--- a/src/tracker-extract/tracker-main.c
++++ b/src/tracker-extract/tracker-main.c
+@@ -141,9 +141,6 @@ run_standalone (void)
+ 		output_format_name = "turtle";
+ 	}
+ 
+-	/* This makes sure we don't steal all the system's resources */
+-	initialize_priority_and_scheduling ();
+-
+ 	/* Look up the output format by name */
+ 	enum_class = g_type_class_ref (TRACKER_TYPE_SERIALIZATION_FORMAT);
+ 	enum_value = g_enum_get_value_by_nick (enum_class, output_format_name);
+@@ -222,8 +219,8 @@ on_decorator_finished (TrackerDecorator *decorator,
+ 	                                             main_loop);
+ }
+ 
+-int
+-main (int argc, char *argv[])
++static int
++do_main (int argc, char *argv[])
+ {
+ 	GOptionContext *context;
+ 	GError *error = NULL;
+@@ -242,9 +239,6 @@ main (int argc, char *argv[])
+ 	bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
+ 	textdomain (GETTEXT_PACKAGE);
+ 
+-	/* This makes sure we don't steal all the system's resources */
+-	initialize_priority_and_scheduling ();
+-
+ 	/* Translators: this message will appear immediately after the  */
+ 	/* usage string - Usage: COMMAND [OPTION]... <THIS_MESSAGE>     */
+ 	context = g_option_context_new (_("— Extract file meta data"));
+@@ -409,3 +403,17 @@ main (int argc, char *argv[])
+ 
+ 	return EXIT_SUCCESS;
+ }
++
++int
++main (int argc, char *argv[])
++{
++	/* This function is untouchable! Add things to do_main() */
++
++	/* This makes sure we don't steal all the system's resources */
++	initialize_priority_and_scheduling ();
++
++	if (!tracker_seccomp_init ())
++		g_assert_not_reached ();
++
++	return do_main (argc, argv);
++}
+-- 
+2.43.0
+
+
+From 817ee064dcb3f084dca9937db87a9779124cc189 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Tue, 3 Oct 2023 12:44:42 +0200
+Subject: [PATCH 10/23] libtracker-miners-common: Add custom rules through a
+ define
+
+Bring some more consistence between our ALLOW/ERROR_RULE defines,
+and the "custom" rules where we check syscall arguments.
+---
+ .../tracker-seccomp.c                         | 66 +++++++------------
+ 1 file changed, 23 insertions(+), 43 deletions(-)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index 1182bfd86..59ad185ee 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -56,6 +56,13 @@
+ 		goto out; \
+ } G_STMT_END
+ 
++#define CUSTOM_RULE(call, action, arg1) G_STMT_START { \
++	int custom_rule_syscall_number = seccomp_syscall_resolve_name (G_STRINGIFY (call)); \
++	if (custom_rule_syscall_number == __NR_SCMP_ERROR || \
++	    seccomp_rule_add (ctx, action, custom_rule_syscall_number, 1, arg1) < 0) \
++		goto out; \
++} G_STMT_END
++
+ static void
+ sigsys_handler (gint       signal,
+                 siginfo_t *info,
+@@ -237,57 +244,30 @@ tracker_seccomp_init (void)
+ 	ERROR_RULE (sched_getattr, EPERM);
+ 
+ 	/* Allow prlimit64, only if no new limits are being set */
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(prlimit64), 1,
+-	                      SCMP_CMP(2, SCMP_CMP_EQ, 0)) < 0)
+-		goto out;
++	CUSTOM_RULE (prlimit64, SCMP_ACT_ALLOW, SCMP_CMP(2, SCMP_CMP_EQ, 0));
+ 
+ 	/* Special requirements for socket/socketpair, only on AF_UNIX/AF_LOCAL */
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
+-	                      SCMP_CMP(0, SCMP_CMP_EQ, AF_UNIX)) < 0)
+-		goto out;
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
+-	                      SCMP_CMP(0, SCMP_CMP_EQ, AF_LOCAL)) < 0)
+-		goto out;
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ERRNO (EACCES), SCMP_SYS(socket), 1,
+-	                      SCMP_CMP(0, SCMP_CMP_EQ, AF_NETLINK)) < 0)
+-		goto out;
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(socketpair), 1,
+-	                      SCMP_CMP(0, SCMP_CMP_EQ, AF_UNIX)) < 0)
+-		goto out;
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(socketpair), 1,
+-	                      SCMP_CMP(0, SCMP_CMP_EQ, AF_LOCAL)) < 0)
+-		goto out;
++	CUSTOM_RULE (socket, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, AF_UNIX));
++	CUSTOM_RULE (socket, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, AF_LOCAL));
++	CUSTOM_RULE (socket, SCMP_ACT_ERRNO (EACCES), SCMP_CMP(0, SCMP_CMP_EQ, AF_NETLINK));
++
++	CUSTOM_RULE (socketpair, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, AF_UNIX));
++	CUSTOM_RULE (socketpair, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, AF_LOCAL));
+ 
+ 	/* Special requirements for ioctl, allowed on stdout/stderr */
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 1,
+-	                      SCMP_CMP(0, SCMP_CMP_EQ, 1)) < 0)
+-		goto out;
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 1,
+-	                      SCMP_CMP(0, SCMP_CMP_EQ, 2)) < 0)
+-		goto out;
++	CUSTOM_RULE (ioctl, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, 1));
++	CUSTOM_RULE (ioctl, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, 2));
+ 
+ 	/* Special requirements for open/openat, allow O_RDONLY calls,
+          * but fail if write permissions are requested.
+ 	 */
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(open), 1,
+-	                      SCMP_CMP(1, SCMP_CMP_MASKED_EQ, O_WRONLY | O_RDWR, 0)) < 0)
+-		goto out;
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ERRNO (EACCES), SCMP_SYS(open), 1,
+-	                      SCMP_CMP(1, SCMP_CMP_MASKED_EQ, O_WRONLY, O_WRONLY)) < 0)
+-		goto out;
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ERRNO (EACCES), SCMP_SYS(open), 1,
+-	                      SCMP_CMP(1, SCMP_CMP_MASKED_EQ, O_RDWR, O_RDWR)) < 0)
+-		goto out;
+-
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ALLOW, SCMP_SYS(openat), 1,
+-	                      SCMP_CMP(2, SCMP_CMP_MASKED_EQ, O_WRONLY | O_RDWR, 0)) < 0)
+-		goto out;
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ERRNO (EACCES), SCMP_SYS(openat), 1,
+-	                      SCMP_CMP(2, SCMP_CMP_MASKED_EQ, O_WRONLY, O_WRONLY)) < 0)
+-		goto out;
+-	if (seccomp_rule_add (ctx, SCMP_ACT_ERRNO (EACCES), SCMP_SYS(openat), 1,
+-	                      SCMP_CMP(2, SCMP_CMP_MASKED_EQ, O_RDWR, O_RDWR)) < 0)
+-		goto out;
++	CUSTOM_RULE (open, SCMP_ACT_ALLOW, SCMP_CMP(1, SCMP_CMP_MASKED_EQ, O_WRONLY | O_RDWR, 0));
++	CUSTOM_RULE (open, SCMP_ACT_ERRNO (EACCES), SCMP_CMP(1, SCMP_CMP_MASKED_EQ, O_WRONLY, O_WRONLY));
++	CUSTOM_RULE (open, SCMP_ACT_ERRNO (EACCES), SCMP_CMP(1, SCMP_CMP_MASKED_EQ, O_RDWR, O_RDWR));
++
++	CUSTOM_RULE (openat, SCMP_ACT_ALLOW, SCMP_CMP(2, SCMP_CMP_MASKED_EQ, O_WRONLY | O_RDWR, 0));
++	CUSTOM_RULE (openat, SCMP_ACT_ERRNO (EACCES), SCMP_CMP(2, SCMP_CMP_MASKED_EQ, O_WRONLY, O_WRONLY));
++	CUSTOM_RULE (openat, SCMP_ACT_ERRNO (EACCES), SCMP_CMP(2, SCMP_CMP_MASKED_EQ, O_RDWR, O_RDWR));
+ 
+ 	/* Syscalls may differ between libcs */
+ #if !defined(__GLIBC__)
+-- 
+2.43.0
+
+
+From d87fbc17f3a6b6dc487a722117af6823279ee6c7 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Tue, 3 Oct 2023 12:47:57 +0200
+Subject: [PATCH 11/23] libtracker-miners-common: Improve "bail out" error
+ loading seccomp rules
+
+We are out in the dark if we happen to add syscalls that do not exist on
+obscure architectures. Keep track of the rules being added, so we can
+provide a more useful error if we fall in this situation.
+---
+ src/libtracker-miners-common/tracker-seccomp.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index 59ad185ee..676d37c6c 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -44,6 +44,7 @@
+ 
+ #define ALLOW_RULE(call) G_STMT_START { \
+ 	int allow_rule_syscall_number = seccomp_syscall_resolve_name (G_STRINGIFY (call)); \
++	current_syscall = G_STRINGIFY (call); \
+ 	if (allow_rule_syscall_number == __NR_SCMP_ERROR || \
+ 	    seccomp_rule_add (ctx, SCMP_ACT_ALLOW, allow_rule_syscall_number, 0) < 0) \
+ 		goto out; \
+@@ -51,6 +52,7 @@
+ 
+ #define ERROR_RULE(call, error) G_STMT_START { \
+ 	int error_rule_syscall_number = seccomp_syscall_resolve_name (G_STRINGIFY (call)); \
++	current_syscall = G_STRINGIFY (call); \
+ 	if (error_rule_syscall_number == __NR_SCMP_ERROR || \
+ 	    seccomp_rule_add (ctx, SCMP_ACT_ERRNO (error), error_rule_syscall_number, 0) < 0) \
+ 		goto out; \
+@@ -58,6 +60,7 @@
+ 
+ #define CUSTOM_RULE(call, action, arg1) G_STMT_START { \
+ 	int custom_rule_syscall_number = seccomp_syscall_resolve_name (G_STRINGIFY (call)); \
++	current_syscall = G_STRINGIFY (call); \
+ 	if (custom_rule_syscall_number == __NR_SCMP_ERROR || \
+ 	    seccomp_rule_add (ctx, action, custom_rule_syscall_number, 1, arg1) < 0) \
+ 		goto out; \
+@@ -99,6 +102,7 @@ gboolean
+ tracker_seccomp_init (void)
+ {
+ 	scmp_filter_ctx ctx;
++	const gchar *current_syscall = NULL;
+ 
+ 	if (!initialize_sigsys_handler ())
+ 		return FALSE;
+@@ -286,7 +290,7 @@ tracker_seccomp_init (void)
+ 	}
+ 
+ out:
+-	g_critical ("Failed to load seccomp rules.");
++	g_critical ("Failed to load seccomp rule for syscall '%s'", current_syscall);
+ 	seccomp_release (ctx);
+ 	return FALSE;
+ }
+-- 
+2.43.0
+
+
+From e85f6551fd42678d8048db58967ad79a9f8f728e Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Sun, 8 Oct 2023 00:02:30 +0200
+Subject: [PATCH 12/23] libtracker-miners-common: Add more seccomp rules
+
+Seen on debian/ubuntu on some arches. Make mkdirat error out
+the same way than mkdir, and allow name_to_handle_at() as
+that should be innocuous.
+
+Closes: https://gitlab.gnome.org/GNOME/tracker-miners/-/issues/281
+---
+ src/libtracker-miners-common/tracker-seccomp.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index 676d37c6c..82d1e547a 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -235,11 +235,13 @@ tracker_seccomp_init (void)
+ 	ALLOW_RULE (getsockname);
+ 	ALLOW_RULE (getpeername);
+ 	ALLOW_RULE (shutdown);
++	ALLOW_RULE (name_to_handle_at);
+ 
+ 	ERROR_RULE (inotify_init1, EINVAL);
+ 	ERROR_RULE (inotify_init, EINVAL);
+ 
+ 	ERROR_RULE (mkdir, EPERM);
++	ERROR_RULE (mkdirat, EPERM);
+ 	ERROR_RULE (rename, EPERM);
+ 	ERROR_RULE (unlink, EPERM);
+ 	ERROR_RULE (ioctl, EBADF);
+-- 
+2.43.0
+
+
+From 3f0792b8f8dc7039392d2dee59d7d2b331f551e8 Mon Sep 17 00:00:00 2001
+From: psykose <alice@ayaya.dev>
+Date: Tue, 17 Oct 2023 13:29:56 +0000
+Subject: [PATCH 13/23] libtracker-miners-common: use macro stringify instead
+ of G_STRINGIFY
+
+G_STRINGIFY performs macro expansion; this means that on musl, the LFS64
+interface define of
+ #define getdents64 getdents
+
+gets expanded to 'getdents', so the getdents64 syscall becomes not
+allowed. using the preprocessor #stringify does not expand the name, so
+this works as expected.
+
+closes #285
+---
+ src/libtracker-miners-common/tracker-seccomp.c | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index 82d1e547a..93ab1fc9c 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -43,24 +43,24 @@
+ #endif
+ 
+ #define ALLOW_RULE(call) G_STMT_START { \
+-	int allow_rule_syscall_number = seccomp_syscall_resolve_name (G_STRINGIFY (call)); \
+-	current_syscall = G_STRINGIFY (call); \
++	int allow_rule_syscall_number = seccomp_syscall_resolve_name (#call); \
++	current_syscall = #call; \
+ 	if (allow_rule_syscall_number == __NR_SCMP_ERROR || \
+ 	    seccomp_rule_add (ctx, SCMP_ACT_ALLOW, allow_rule_syscall_number, 0) < 0) \
+ 		goto out; \
+ } G_STMT_END
+ 
+ #define ERROR_RULE(call, error) G_STMT_START { \
+-	int error_rule_syscall_number = seccomp_syscall_resolve_name (G_STRINGIFY (call)); \
+-	current_syscall = G_STRINGIFY (call); \
++	int error_rule_syscall_number = seccomp_syscall_resolve_name (#call); \
++	current_syscall = #call; \
+ 	if (error_rule_syscall_number == __NR_SCMP_ERROR || \
+ 	    seccomp_rule_add (ctx, SCMP_ACT_ERRNO (error), error_rule_syscall_number, 0) < 0) \
+ 		goto out; \
+ } G_STMT_END
+ 
+ #define CUSTOM_RULE(call, action, arg1) G_STMT_START { \
+-	int custom_rule_syscall_number = seccomp_syscall_resolve_name (G_STRINGIFY (call)); \
+-	current_syscall = G_STRINGIFY (call); \
++	int custom_rule_syscall_number = seccomp_syscall_resolve_name (#call); \
++	current_syscall = #call; \
+ 	if (custom_rule_syscall_number == __NR_SCMP_ERROR || \
+ 	    seccomp_rule_add (ctx, action, custom_rule_syscall_number, 1, arg1) < 0) \
+ 		goto out; \
+-- 
+2.43.0
+
+
+From aa9674c112a4fe6b3cd0ce2dfd3e328e79cc6b19 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Mon, 16 Oct 2023 11:15:21 +0200
+Subject: [PATCH 14/23] libtracker-miners-common: Allow some more syscalls for
+ i686
+
+These are seen on Debian i686 with the default dependencies pulled
+from apt-get build-dep tracker-miners. There's mainly 32-bit syscall
+variants (getgid32, fstatfs64), some fancy stuff so far unseen in 64-bit
+(timerfd_create), and for some unfathomable reason, gstreamer openNI2
+module using chdir() to change the CWD.
+
+Everything is harmless though, so go with that.
+
+Closes: https://gitlab.gnome.org/GNOME/tracker-miners/-/issues/284
+---
+ src/libtracker-miners-common/tracker-seccomp.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index 93ab1fc9c..560575708 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -130,8 +130,9 @@ tracker_seccomp_init (void)
+ 	/* Process management */
+ 	ALLOW_RULE (exit_group);
+ 	ALLOW_RULE (getuid);
+-	ALLOW_RULE (getgid);
+ 	ALLOW_RULE (getuid32);
++	ALLOW_RULE (getgid);
++	ALLOW_RULE (getgid32);
+ 	ALLOW_RULE (getegid);
+ 	ALLOW_RULE (getegid32);
+ 	ALLOW_RULE (geteuid);
+@@ -155,6 +156,7 @@ tracker_seccomp_init (void)
+ 	ALLOW_RULE (lstat64);
+ 	ALLOW_RULE (statx);
+ 	ALLOW_RULE (fstatfs);
++	ALLOW_RULE (fstatfs64);
+ 	ALLOW_RULE (access);
+ 	ALLOW_RULE (faccessat);
+ 	ALLOW_RULE (faccessat2);
+@@ -168,6 +170,7 @@ tracker_seccomp_init (void)
+ 	ALLOW_RULE (fsync);
+ 	ALLOW_RULE (umask);
+ 	ERROR_RULE (fchown, EPERM);
++	ALLOW_RULE (chdir);
+ 	/* Processes and threads */
+ 	ALLOW_RULE (clone);
+ 	ALLOW_RULE (clone3);
+@@ -208,6 +211,7 @@ tracker_seccomp_init (void)
+ 	ALLOW_RULE (clock_gettime64);
+ 	ALLOW_RULE (clock_getres);
+ 	ALLOW_RULE (gettimeofday);
++	ALLOW_RULE (timerfd_create);
+ 	/* Descriptors */
+ 	ALLOW_RULE (close);
+ 	ALLOW_RULE (read);
+-- 
+2.43.0
+
+
+From fcea50534fc4ba8a7dc095e4572723095850e4ae Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Tue, 17 Oct 2023 12:52:32 +0200
+Subject: [PATCH 15/23] libtracker-miners-common: Allow NETLINK_KOBJECT_UEVENT
+ access
+
+Sadly, it remains extremely finicky to provide detailed rules with
+differing actions for socket() through libseccomp(), due to the way this
+syscall is (was?) wrapped through the multiplexed socketcall() syscall on
+some architectures.
+
+Since we cannot provide different SCMP_ACT_* values, and we cannot let
+AF_NETLINK/NETLINK_KOBJECT_UEVENT requests fail with SIGSYS (e.g.
+video4linux2 gstreamer plugin wants udev access and will trigger this
+right in gst_init()), go with SCMP_ACT_ALLOW for this specific combination,
+along with AF_LOCAL.
+
+This kind of socket is effectively readonly to unprivileged users and
+local by definition, so it does not seem a big risk to allow, the only
+lingering question being "why should we allow this".
+
+Closes: https://gitlab.gnome.org/GNOME/tracker-miners/-/issues/283
+---
+ src/libtracker-miners-common/tracker-seccomp.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index 560575708..5e371b457 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -36,6 +36,8 @@
+ #include <sys/socket.h>
+ #include <fcntl.h>
+ 
++#include <linux/netlink.h>
++
+ #include <seccomp.h>
+ 
+ #ifndef SYS_SECCOMP
+@@ -66,6 +68,14 @@
+ 		goto out; \
+ } G_STMT_END
+ 
++#define CUSTOM_RULE_2ARG(call, action, arg1, arg2) G_STMT_START {	  \
++	int custom_rule_syscall_number = seccomp_syscall_resolve_name (#call); \
++	current_syscall = #call; \
++	if (custom_rule_syscall_number == __NR_SCMP_ERROR || \
++	    seccomp_rule_add (ctx, action, custom_rule_syscall_number, 2, arg1, arg2) < 0) \
++		goto out; \
++} G_STMT_END
++
+ static void
+ sigsys_handler (gint       signal,
+                 siginfo_t *info,
+@@ -256,10 +266,14 @@ tracker_seccomp_init (void)
+ 	/* Allow prlimit64, only if no new limits are being set */
+ 	CUSTOM_RULE (prlimit64, SCMP_ACT_ALLOW, SCMP_CMP(2, SCMP_CMP_EQ, 0));
+ 
+-	/* Special requirements for socket/socketpair, only on AF_UNIX/AF_LOCAL */
++	/* Special requirements for socket/socketpair, only on AF_UNIX/AF_LOCAL,
++	 * and AF_NETLINK/NETLINK_KOBJECT_UEVENT for udev.
++	 */
+ 	CUSTOM_RULE (socket, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, AF_UNIX));
+ 	CUSTOM_RULE (socket, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, AF_LOCAL));
+-	CUSTOM_RULE (socket, SCMP_ACT_ERRNO (EACCES), SCMP_CMP(0, SCMP_CMP_EQ, AF_NETLINK));
++	CUSTOM_RULE_2ARG (socket, SCMP_ACT_ALLOW,
++	                  SCMP_CMP (0, SCMP_CMP_EQ, AF_NETLINK),
++	                  SCMP_CMP (2, SCMP_CMP_EQ, NETLINK_KOBJECT_UEVENT));
+ 
+ 	CUSTOM_RULE (socketpair, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, AF_UNIX));
+ 	CUSTOM_RULE (socketpair, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, AF_LOCAL));
+-- 
+2.43.0
+
+
+From 3ea068a401cac04bf019510d78e11c12a2cf9c99 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Tue, 17 Oct 2023 09:31:33 +0200
+Subject: [PATCH 16/23] libtracker-miners-common: Allow tgkill on self's
+ process
+
+This is the syscall underneath abort(), assert(), etc. Let this
+syscall through for the purpose of killing self's process, and
+don't hide the actual errors.
+
+Closes: https://gitlab.gnome.org/GNOME/tracker-miners/-/issues/287
+---
+ src/libtracker-miners-common/tracker-seccomp.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index 5e371b457..84585e1a2 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -263,6 +263,9 @@ tracker_seccomp_init (void)
+ 	ERROR_RULE (setsockopt, EBADF);
+ 	ERROR_RULE (sched_getattr, EPERM);
+ 
++	/* Allow tgkill on self, for abort() and friends */
++	CUSTOM_RULE (tgkill, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, getpid()));
++
+ 	/* Allow prlimit64, only if no new limits are being set */
+ 	CUSTOM_RULE (prlimit64, SCMP_ACT_ALLOW, SCMP_CMP(2, SCMP_CMP_EQ, 0));
+ 
+-- 
+2.43.0
+
+
+From 23ffd98b1c6ca890a94d574f93c092eddada5003 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Tue, 17 Oct 2023 12:48:42 +0200
+Subject: [PATCH 17/23] tracker-extract: Initialize modules also before
+ commandline extraction
+
+This allows the gstreamer module to block plugins through the registry
+in those paths too.
+---
+ src/tracker-extract/tracker-main.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/tracker-extract/tracker-main.c b/src/tracker-extract/tracker-main.c
+index b5cf53fee..52c46359d 100644
+--- a/src/tracker-extract/tracker-main.c
++++ b/src/tracker-extract/tracker-main.c
+@@ -293,6 +293,9 @@ do_main (int argc, char *argv[])
+ 		return EXIT_FAILURE;
+ 	}
+ 
++	tracker_extract_module_manager_init ();
++	tracker_module_manager_load_modules ();
++
+ 	/* Set conditions when we use stand alone settings */
+ 	if (filename) {
+ 		return run_standalone ();
+@@ -304,8 +307,6 @@ do_main (int argc, char *argv[])
+ 		return EXIT_FAILURE;
+ 	}
+ 
+-	tracker_module_manager_load_modules ();
+-
+ 	miner_dbus_name = tracker_domain_ontology_get_domain (domain_ontology,
+ 	                                                      MINER_FS_NAME_SUFFIX);
+ 	sparql_connection = tracker_sparql_connection_bus_new (miner_dbus_name,
+-- 
+2.43.0
+
+
+From b4d1e177b99c2097bf6ee2ceb6a5c7c8d5548c20 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Tue, 17 Oct 2023 13:11:07 +0200
+Subject: [PATCH 18/23] libtracker-miners-common: Allow restart_syscall syscall
+
+This syscall may happen after SIGCONT if a previous SIGSTOP caught
+the process mid-syscall. This is a plausible situation with gdb, and
+through coredumpd/abrtd/etc.
+
+Closes: https://gitlab.gnome.org/GNOME/tracker-miners/-/issues/288
+---
+ src/libtracker-miners-common/tracker-seccomp.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index 84585e1a2..f2283cb91 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -199,6 +199,7 @@ tracker_seccomp_init (void)
+ 	ALLOW_RULE (waitid);
+ 	ALLOW_RULE (waitpid);
+ 	ALLOW_RULE (wait4);
++	ALLOW_RULE (restart_syscall);
+ 	/* Main loops */
+ 	ALLOW_RULE (poll);
+ 	ALLOW_RULE (ppoll);
+-- 
+2.43.0
+
+
+From fd9061b434b69d704346926ffc11a14f758aa1b6 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Tue, 17 Oct 2023 14:12:33 +0200
+Subject: [PATCH 19/23] libtracker-miners-common: Drop ioctl rules for
+ stdout/stderr
+
+These were added in the first instance of the sandbox, I do not
+remember what they were for, and they seem largely unnecessary
+nowadays.
+---
+ src/libtracker-miners-common/tracker-seccomp.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index f2283cb91..10d5c95e9 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -282,10 +282,6 @@ tracker_seccomp_init (void)
+ 	CUSTOM_RULE (socketpair, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, AF_UNIX));
+ 	CUSTOM_RULE (socketpair, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, AF_LOCAL));
+ 
+-	/* Special requirements for ioctl, allowed on stdout/stderr */
+-	CUSTOM_RULE (ioctl, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, 1));
+-	CUSTOM_RULE (ioctl, SCMP_ACT_ALLOW, SCMP_CMP(0, SCMP_CMP_EQ, 2));
+-
+ 	/* Special requirements for open/openat, allow O_RDONLY calls,
+          * but fail if write permissions are requested.
+ 	 */
+-- 
+2.43.0
+
+
+From 5ab90ea05181807d56e8a2244260b8c974b7732c Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Tue, 17 Oct 2023 14:28:29 +0200
+Subject: [PATCH 20/23] libtracker-miners-common: Disallow close/dup2/dup3 on
+ standard I/O FDs
+
+As an additional measure, forbid these FDs to be replaced by anything.
+---
+ src/libtracker-miners-common/tracker-seccomp.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index 10d5c95e9..2448e2232 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -224,7 +224,9 @@ tracker_seccomp_init (void)
+ 	ALLOW_RULE (gettimeofday);
+ 	ALLOW_RULE (timerfd_create);
+ 	/* Descriptors */
+-	ALLOW_RULE (close);
++	CUSTOM_RULE (close, SCMP_ACT_ALLOW, SCMP_CMP (0, SCMP_CMP_GT, STDERR_FILENO));
++	CUSTOM_RULE (dup2, SCMP_ACT_ALLOW, SCMP_CMP (1, SCMP_CMP_GT, STDERR_FILENO));
++	CUSTOM_RULE (dup3, SCMP_ACT_ALLOW, SCMP_CMP (1, SCMP_CMP_GT, STDERR_FILENO));
+ 	ALLOW_RULE (read);
+ 	ALLOW_RULE (lseek);
+ 	ALLOW_RULE (_llseek);
+@@ -234,8 +236,6 @@ tracker_seccomp_init (void)
+ 	ALLOW_RULE (write);
+ 	ALLOW_RULE (writev);
+ 	ALLOW_RULE (dup);
+-	ALLOW_RULE (dup2);
+-	ALLOW_RULE (dup3);
+ 	/* Needed by some GStreamer modules doing crazy stuff, less
+ 	 * scary thanks to the restriction below about sockets being
+ 	 * local.
+-- 
+2.43.0
+
+
+From 02da14025dfdcc0cd7bf00d5dd3fdb246a06cb03 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Tue, 17 Oct 2023 16:10:11 +0200
+Subject: [PATCH 21/23] libtracker-miners-common: Forbid some more
+ open()/openat() flags
+
+There are some nasty combinations with O_RDONLY that may already
+trigger unintended results, like O_CREAT and O_TRUNC. Avoid any
+combination that sounds off with O_RDONLY.
+---
+ src/libtracker-miners-common/tracker-seccomp.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/libtracker-miners-common/tracker-seccomp.c b/src/libtracker-miners-common/tracker-seccomp.c
+index 2448e2232..26b853539 100644
+--- a/src/libtracker-miners-common/tracker-seccomp.c
++++ b/src/libtracker-miners-common/tracker-seccomp.c
+@@ -285,11 +285,15 @@ tracker_seccomp_init (void)
+ 	/* Special requirements for open/openat, allow O_RDONLY calls,
+          * but fail if write permissions are requested.
+ 	 */
+-	CUSTOM_RULE (open, SCMP_ACT_ALLOW, SCMP_CMP(1, SCMP_CMP_MASKED_EQ, O_WRONLY | O_RDWR, 0));
++	CUSTOM_RULE (open, SCMP_ACT_ALLOW,
++	             SCMP_CMP (1, SCMP_CMP_MASKED_EQ,
++	                       O_WRONLY | O_RDWR | O_APPEND | O_CREAT | O_TRUNC | O_EXCL, 0));
+ 	CUSTOM_RULE (open, SCMP_ACT_ERRNO (EACCES), SCMP_CMP(1, SCMP_CMP_MASKED_EQ, O_WRONLY, O_WRONLY));
+ 	CUSTOM_RULE (open, SCMP_ACT_ERRNO (EACCES), SCMP_CMP(1, SCMP_CMP_MASKED_EQ, O_RDWR, O_RDWR));
+ 
+-	CUSTOM_RULE (openat, SCMP_ACT_ALLOW, SCMP_CMP(2, SCMP_CMP_MASKED_EQ, O_WRONLY | O_RDWR, 0));
++	CUSTOM_RULE (openat, SCMP_ACT_ALLOW,
++	             SCMP_CMP (2, SCMP_CMP_MASKED_EQ,
++	                       O_WRONLY | O_RDWR | O_APPEND | O_CREAT | O_TRUNC | O_EXCL, 0));
+ 	CUSTOM_RULE (openat, SCMP_ACT_ERRNO (EACCES), SCMP_CMP(2, SCMP_CMP_MASKED_EQ, O_WRONLY, O_WRONLY));
+ 	CUSTOM_RULE (openat, SCMP_ACT_ERRNO (EACCES), SCMP_CMP(2, SCMP_CMP_MASKED_EQ, O_RDWR, O_RDWR));
+ 
+-- 
+2.43.0
+
+
+From 3698d44ef041582c15f2f938f42ecff5b5f37ff7 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Mon, 23 Oct 2023 19:17:41 +0200
+Subject: [PATCH 22/23] tracker-miner-fs: Preempt GStreamer registry file
+ creation
+
+Initialize gstreamer in tracker-miner-fs, mostly as a means to
+ensure the registry file is guaranteed to exist and be up-to-date
+when the tracker-extract-3 process gets to start up and require the
+use of GStreamer plugins.
+---
+ src/miners/fs/meson.build    | 7 ++++---
+ src/miners/fs/tracker-main.c | 7 +++++++
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/src/miners/fs/meson.build b/src/miners/fs/meson.build
+index 57c8ffdc5..5ac87f25b 100644
+--- a/src/miners/fs/meson.build
++++ b/src/miners/fs/meson.build
+@@ -8,9 +8,10 @@ sources = [
+ ]
+ 
+ tracker_miner_fs_deps = [
+-     tracker_miner,
+-     tracker_miners_common_dep,
+-     tracker_extract_dep
++    tracker_miner,
++    tracker_miners_common_dep,
++    tracker_extract_dep,
++    gstreamer,
+ ]
+ 
+ if battery_detection_library_name == 'upower'
+diff --git a/src/miners/fs/tracker-main.c b/src/miners/fs/tracker-main.c
+index 292480a0b..b23387188 100644
+--- a/src/miners/fs/tracker-main.c
++++ b/src/miners/fs/tracker-main.c
+@@ -35,6 +35,8 @@
+ #include <glib-object.h>
+ #include <glib/gi18n.h>
+ 
++#include <gst/gst.h>
++
+ #include <libtracker-miners-common/tracker-common.h>
+ #include <libtracker-sparql/tracker-sparql.h>
+ #include <libtracker-miner/tracker-miner.h>
+@@ -984,6 +986,11 @@ main (gint argc, gchar *argv[])
+ 	/* This makes sure we don't steal all the system's resources */
+ 	initialize_priority_and_scheduling ();
+ 
++	/* Preempt possible registry updates, before tracker-extract-3 deals
++	 * with gstreamer plugins.
++	 */
++	gst_init (NULL, NULL);
++
+ 	/* Translators: this messagge will apper immediately after the
+ 	 * usage string - Usage: COMMAND <THIS_MESSAGE>
+ 	 */
+-- 
+2.43.0
+
+
+From 22677c3d65198bdbfffeb1a326a4b8d501282d78 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlosg@gnome.org>
+Date: Wed, 25 Oct 2023 11:21:17 +0200
+Subject: [PATCH 23/23] tracker-extract: Disable GST registry updates in
+ extractor process
+
+Force disable the attempt to update the GStreamer registry from the extractor
+process, creation of files is softly forbidden by the seccomp sandbox anyway.
+This will have the nice side effect of avoiding GStreamer from attempting to
+load changed/new modules at gst_init() time (and the crazy shit some of them
+do during plugin initialization), while the less nice side effect (the extractor
+not finding old/stale plugins, and being unable to use new ones) should have been
+largely avoided by the previous commit.
+---
+ src/tracker-extract/tracker-main.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/tracker-extract/tracker-main.c b/src/tracker-extract/tracker-main.c
+index 52c46359d..bb29dfc01 100644
+--- a/src/tracker-extract/tracker-main.c
++++ b/src/tracker-extract/tracker-main.c
+@@ -235,6 +235,8 @@ do_main (int argc, char *argv[])
+ 	TrackerDomainOntology *domain_ontology;
+ 	gchar *dbus_name, *miner_dbus_name;
+ 
++	g_setenv ("GST_REGISTRY_UPDATE", "no", TRUE);
++
+ 	bindtextdomain (GETTEXT_PACKAGE, LOCALEDIR);
+ 	bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
+ 	textdomain (GETTEXT_PACKAGE);
+-- 
+2.43.0
+

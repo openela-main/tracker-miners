@@ -1,0 +1,11 @@
+diff -up tracker-miners-2.1.5/src/libtracker-miners-common/tracker-seccomp.c.fchown tracker-miners-2.1.5/src/libtracker-miners-common/tracker-seccomp.c
+--- tracker-miners-2.1.5/src/libtracker-miners-common/tracker-seccomp.c.fchown	2025-01-16 16:21:36.991391911 +0100
++++ tracker-miners-2.1.5/src/libtracker-miners-common/tracker-seccomp.c	2025-01-16 16:21:58.078407022 +0100
+@@ -135,6 +135,7 @@ tracker_seccomp_init (void)
+ 	ALLOW_RULE (fsync);
+ 	ALLOW_RULE (umask);
+ 	ALLOW_RULE (chdir);
++	ERROR_RULE (fchown, EPERM);
+ 	/* Processes and threads */
+ 	ALLOW_RULE (clone);
+ 	ALLOW_RULE (futex);
